@@ -1,0 +1,23 @@
+[package]
+name = "gcp-lb-controller-rs"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+env_logger = "0.11.3"
+k8s-openapi = { version = "0.21.1", features = ["latest", "schemars"] }
+kube = { version = "0.90.0", features = ["runtime", "derive", "unstable-runtime"] }
+log = "0.4.21"
+reqwest = { version = "0.12.3", features = ["json"] }
+serde = { version = "1.0.197", features = ["derive"] }
+serde_json = "1.0.115"
+tokio = { version = "1.37.0", features = ["full"] }
+futures = "0.3.30"
+thiserror = "1.0.58"
+regex = "1.10.4"
+anyhow = "1.0.82"
+rand = "0.8.5"
+clap = { version = "4.5.4", features = ["derive"] }
+json-patch = "1.2.0"
