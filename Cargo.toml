@@ -20,4 +20,4 @@ regex = "1.10.4"
 anyhow = "1.0.82"
 rand = "0.8.5"
 clap = { version = "4.5.4", features = ["derive"] }
-json-patch = "1.2.0"
+json-patch = "2.0.0"
