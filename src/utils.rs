@@ -16,13 +16,12 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context};
-use json_patch::{PatchOperation, RemoveOperation, TestOperation};
 use k8s_openapi::api::core::v1::{
     LoadBalancerIngress, LoadBalancerStatus, Node, Service, ServiceStatus,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::api::{ListParams, PartialObjectMetaExt, Patch, PatchParams};
-use kube::{Api, Client, Resource, ResourceExt};
+use kube::{Api, Client, ResourceExt};
 use log::{debug, info};
 use rand::random;
 use regex::Regex;
@@ -421,44 +420,6 @@ pub(crate) fn _check_if_finalizer_exists(svc: &Service) -> bool {
         .flatten()
         .into_iter()
         .any(|f| f.eq(&format!("{}/cleanup", CONTROLLER_NAME)))
-}
-
-pub(crate) async fn _remove_finalizer(svc: &Service, k8s_client: &Client) -> anyhow::Result<()> {
-    let finalizer = format!("{}/cleanup", CONTROLLER_NAME);
-    let service_name = &svc.name_any();
-    let service_ns = &svc.namespace().unwrap();
-    let api: Api<Service> = Api::<Service>::namespaced(k8s_client.to_owned(), service_ns);
-    if let Some(i) = svc
-        .meta()
-        .finalizers
-        .iter()
-        .flatten()
-        .into_iter()
-        .position(|f| f.eq(&format!("{}/cleanup", CONTROLLER_NAME)))
-    {
-        let finalizer_path = format!("/metadata/finalizers/{}", i);
-        api.patch::<Service>(
-            &service_name,
-            &PatchParams::default(),
-            &Patch::Json(json_patch::Patch(vec![
-                PatchOperation::Test(TestOperation {
-                    path: finalizer_path.clone(),
-                    value: finalizer.into(),
-                }),
-                PatchOperation::Remove(RemoveOperation {
-                    path: finalizer_path,
-                }),
-            ])),
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "failed to remove finalizer for service: {}/{}",
-                service_ns, service_name
-            )
-        })?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
