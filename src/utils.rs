@@ -31,7 +31,7 @@ use std::borrow::BorrowMut;
 use std::sync::Arc;
 
 use crate::constants::{
-    COMPUTE_ENDPOINT, CONTROLLER_NAME, LB_REGIONAL_MIG_ANNOTATION_KEY, LB_ZONAL_MIG_ANNOTATION_KEY,
+    COMPUTE_ENDPOINT, LB_REGIONAL_MIG_ANNOTATION_KEY, LB_ZONAL_MIG_ANNOTATION_KEY,
 };
 use crate::constants::{
     LB_BACKEND_SVC_ANNOTATION_KEY, LB_FIREWALL_RULE_ANNOTATION_KEY,
@@ -411,15 +411,6 @@ pub(crate) fn check_backend_svc_prerequisites(
         ));
     }
     Ok(())
-}
-
-pub(crate) fn _check_if_finalizer_exists(svc: &Service) -> bool {
-    svc.metadata
-        .finalizers
-        .iter()
-        .flatten()
-        .into_iter()
-        .any(|f| f.eq(&format!("{}/cleanup", CONTROLLER_NAME)))
 }
 
 #[cfg(test)]

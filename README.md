@@ -9,12 +9,12 @@ This controller is for Kubernetes environments and provisions GCP loadbalancer i
 
 ### Configuration:
 
-| Annotation                         | Description                                                                                                                                                                                                                                              |
-|------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `gcp-lb-controller/hc-port`        | The port used to create health check. If not provided, first port in the service spec will be used.                                                                                                                                                      |
-| `gcp-lb-controller/regional-migs`  | Comma separated regional managed instance groups. These should be in the same region as the cluster resources. If not provided zonal unmanaged instance groups will be created for all nodes in the cluster.                                             |
-| `gcp-lb-controller/zonal-migs`     | Map of zonal managed instance groups, for example "{\"us-central1-a\":\"instance-group-1\"}". These should be in the same region as the cluster resources. If not provided zonal unmanaged instance groups will be created for all nodes in the cluster. |
-| `gcp-lb-controller/static-ip-name` | Static ip address resource name for the load balancer, this needs to be in the same region as the cluster.                                                                                                                                               |
+| Annotation                         | Description                                                                                                                                                                                                                                                     |
+|------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `gcp-lb-controller/hc-port`        | The port used to create health check. If not provided, first port in the <br/>service spec will be used.                                                                                                                                                        |
+| `gcp-lb-controller/regional-migs`  | Comma separated regional managed instance groups. <br/>These should be in the same region as the cluster resources. If not provided zonal unmanaged instance groups will be created for all nodes in the cluster.                                               |
+| `gcp-lb-controller/zonal-migs`     | Map of zonal managed instance groups, for example <br/>`"{\"us-central1-a\":\"instance-group-1\"}"`. These should be in the same region as the cluster resources. If not provided zonal unmanaged instance groups will be created for all nodes in the cluster. |
+| `gcp-lb-controller/static-ip-name` | Static ip address resource name for the load balancer, this needs to be in the <br/>same region as the cluster.                                                                                                                                                 |
 
 ### Command line arguments
 
