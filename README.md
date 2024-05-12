@@ -1,4 +1,5 @@
 ## GCP loadbalancer controller
+[![build](https://github.com/GoogleCloudPlatform/gcp-lb-controller-rs/actions/workflows/build.yml/badge.svg)](https://github.com/GoogleCloudPlatform/gcp-lb-controller-rs/actions/workflows/build.yml)
 
 This controller is for Kubernetes environments and provisions GCP loadbalancer infrastructure for services of type `LoadBalancer`.
 
