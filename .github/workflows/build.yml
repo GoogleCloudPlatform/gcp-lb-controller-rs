@@ -1,0 +1,24 @@
+name: cargo build
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@0ad4b8fadaa221de15dcec353f45205ec38ea70b
+      - name: Setup rust nightly
+        run: rustup default nightly
+      - name: Run tests
+        run: cargo test
+      - name: Build
+        run: cargo build
