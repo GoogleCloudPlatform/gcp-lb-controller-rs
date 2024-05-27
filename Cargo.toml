@@ -11,7 +11,7 @@ k8s-openapi = { version = "0.22.0", features = ["latest", "schemars"] }
 kube = { version = "0.91.0", features = ["runtime", "derive", "unstable-runtime"] }
 log = "0.4.21"
 reqwest = { version = "0.12.4", features = ["json"] }
-serde = { version = "1.0.202", features = ["derive"] }
+serde = { version = "1.0.203", features = ["derive"] }
 serde_json = "1.0.117"
 tokio = { version = "1.37.0", features = ["full"] }
 futures = "0.3.30"
