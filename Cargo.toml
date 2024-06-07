@@ -19,5 +19,5 @@ thiserror = "1.0.61"
 regex = "1.10.4"
 anyhow = "1.0.86"
 rand = "0.8.5"
-clap = { version = "4.5.4", features = ["derive"] }
+clap = { version = "4.5.6", features = ["derive"] }
 json-patch = "2.0.0"
