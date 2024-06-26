@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![feature(fs_try_exists)]
 #![feature(async_closure)]
 #![feature(slice_take)]
 

@@ -32,7 +32,7 @@ pub(crate) struct AccessTokenResponse {
 
 pub async fn get_access_token() -> anyhow::Result<String> {
     let home = std::env::var("HOME").expect("couldn't find HOME.");
-    if fs::try_exists(format!("{}/{}", home, CREDENTIALS_FILE))? {
+    if fs::exists(format!("{}/{}", home, CREDENTIALS_FILE))? {
         debug!("using user credentials");
         fetch_user_access_token().await
     } else {
