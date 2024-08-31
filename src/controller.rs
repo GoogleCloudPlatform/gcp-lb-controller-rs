@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -94,52 +95,53 @@ async fn reconcile(svc: Arc<Service>, ctx: Arc<Ctx>) -> Result<Action> {
 async fn create(svc: Arc<Service>, ctx: Arc<Ctx>) -> Result<Action> {
     let service_ns = &svc.namespace().unwrap();
     let service_name = &svc.name_any();
-    let annotations = &svc.metadata.annotations;
-    if let Some(data) = annotations {
-        info!(
-            "creating loadbalancer for service: {}/{}",
+    let annotations = match &svc.metadata.annotations {
+        Some(data) => data,
+        None => &BTreeMap::<String, String>::new(),
+    };
+    info!(
+        "creating loadbalancer for service: {}/{}",
+        service_ns, service_name
+    );
+    let region = &gcp_auth::get_region().await?;
+    api::process_instance_groups(&svc, region, annotations, &ctx.client.clone())
+        .await
+        .map_err(ControllerError)?;
+
+    api::process_health_checks(&svc, region, annotations, &ctx.client.clone())
+        .await
+        .map_err(ControllerError)?;
+
+    if let Err(_) = utils::check_backend_svc_prerequisites(service_name, service_ns, annotations) {
+        debug!(
+            "waiting for health check and instance groups for service: {}/{}",
             service_ns, service_name
         );
-        let region = &gcp_auth::get_region().await?;
-        api::process_instance_groups(&svc, region, data, &ctx.client.clone())
-            .await
-            .map_err(ControllerError)?;
-
-        api::process_health_checks(&svc, region, data, &ctx.client.clone())
-            .await
-            .map_err(ControllerError)?;
-
-        if let Err(_) = utils::check_backend_svc_prerequisites(service_name, service_ns, data) {
-            debug!(
-                "waiting for health check and instance groups for service: {}/{}",
-                service_ns, service_name
-            );
-            return Ok(Action::requeue(Duration::from_secs(10)));
-        }
-        api::process_backend_service(&svc, region, data, &ctx.client.clone())
-            .await
-            .map_err(ControllerError)?;
-
-        if let Err(_) = utils::check_resource_prerequisites(
-            service_name,
-            service_ns,
-            data,
-            vec![LB_BACKEND_SVC_ANNOTATION_KEY],
-        ) {
-            debug!(
-                "waiting for backends for service: {}/{}",
-                service_ns, service_name
-            );
-            return Ok(Action::requeue(Duration::from_secs(10)));
-        }
-        api::process_forwarding_rule(&svc, region, data, &ctx.client.clone())
-            .await
-            .map_err(ControllerError)?;
-        info!(
-            "ensured loadbalancer for service: {}/{}",
-            service_ns, service_name
-        );
+        return Ok(Action::requeue(Duration::from_secs(10)));
     }
+    api::process_backend_service(&svc, region, annotations, &ctx.client.clone())
+        .await
+        .map_err(ControllerError)?;
+
+    if let Err(_) = utils::check_resource_prerequisites(
+        service_name,
+        service_ns,
+        annotations,
+        vec![LB_BACKEND_SVC_ANNOTATION_KEY],
+    ) {
+        debug!(
+            "waiting for backends for service: {}/{}",
+            service_ns, service_name
+        );
+        return Ok(Action::requeue(Duration::from_secs(10)));
+    }
+    api::process_forwarding_rule(&svc, region, annotations, &ctx.client.clone())
+        .await
+        .map_err(ControllerError)?;
+    info!(
+        "ensured loadbalancer for service: {}/{}",
+        service_ns, service_name
+    );
     Ok(Action::await_change())
 }
 

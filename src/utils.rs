@@ -41,7 +41,7 @@ use crate::constants::{
 
 pub(crate) fn get_hc_name_from_target_link(link: &str) -> anyhow::Result<String> {
     debug!("getting health check name from target link: {}", link);
-    let re = Regex::new(r"^(\S+/projects/\S+/regions/\S+/healthChecks/(?P<name>\S+))$").unwrap();
+    let re = Regex::new(r"^(\S+/projects/\S+/regions/\S+/healthChecks/(?P<name>\S+))$")?;
     let caps = re.captures(link);
     match caps {
         Some(caps) => Ok(String::from(&caps["name"])),
@@ -72,7 +72,7 @@ pub(crate) async fn get_zones_to_instances_map(
         }
     }
     let mut instances_map = HashMap::<String, Vec<String>>::new();
-    let re = Regex::new(r"^((?P<instance_name>\S+)\.(?P<zone>\S+)\.c\.\S+\.internal)$").unwrap();
+    let re = Regex::new(r"^((?P<instance_name>\S+)\.(?P<zone>\S+)\.c\.\S+\.internal)$")?;
     for host in nodes_hostnames {
         let caps = re.captures(host.as_str());
         if let Some(c) = caps {

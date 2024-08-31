@@ -129,7 +129,7 @@ pub(crate) async fn create_tcp_hc(
             ))
         };
     }
-    return Ok(());
+    Ok(())
 }
 
 pub(crate) async fn process_health_checks(
@@ -748,8 +748,8 @@ pub(crate) async fn create_forwarding_rule(
         .into_iter()
         .flat_map(|t| t.ports.borrow())
         .flatten()
-        .map(|t| t.port.borrow())
-        .collect::<Vec<&i32>>();
+        .map(|t| t.port)
+        .collect::<Vec<_>>();
     let payload = match annotations.get(LB_STATIC_IP_ANNOTATION_KEY) {
         Some(name) => json!({
             "name": format!("forwarding-rule-{}-{}-{}", service_ns, service_name, utils::random_string()),
@@ -806,10 +806,10 @@ pub(crate) async fn create_forwarding_rule(
             .map_err(ControllerError)?;
         Ok(())
     } else {
-        return Err(anyhow!(
+        Err(anyhow!(
             "failed to create forwarding rule, error_message: {}",
             res["statusMessage"]
-        ));
+        ))
     }
 }
 
@@ -900,19 +900,17 @@ pub(crate) async fn check_if_all_instances_exist_in_instance_group(
         .await?
         .json::<Value>()
         .await?;
-    let mut current_instances = vec![];
-    if let Some(items) = res["items"].as_array() {
-        for item in items {
-            current_instances.push(item["instance"].as_str());
-        }
-    }
+    let current_instances = res["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|i| i.as_str())
+        .collect::<Vec<_>>();
     for instance in instances {
-        if !current_instances.iter().any(|&i| match i {
-            Some(url) => {
-                return url.split("/").last().unwrap().to_string().eq(instance);
-            }
-            None => false,
-        }) {
+        if !current_instances
+            .iter()
+            .any(|&i| i.split("/").last().eq(&Some(instance)))
+        {
             return Ok(false);
         }
     }
@@ -1023,71 +1021,3 @@ pub(crate) async fn get_ip_addr(
         )),
     }
 }
-
-// pub(crate) async fn get_instances(project: &str) -> anyhow::Result<HashMap<String, Vec<String>>> {
-//     let auth_token = gcp_auth::get_access_token().await?;
-//     let zones = get_zones_in_region(project, region).await?;
-//     let mut instances = HashMap::<String, Vec<String>>::new();
-//     for zone in zones {
-//         let res = reqwest::Client::new()
-//             .get(format!(
-//                 "{}/compute/v1/projects/{}/zones/{}/instances",
-//                 COMPUTE_ENDPOINT, project, zone
-//             ))
-//             .header(ACCEPT, "application/json")
-//             .bearer_auth(&auth_token)
-//             .send()
-//             .await?
-//             .json::<Value>()
-//             .await?;
-//         if let Some(items) = res.get("items") {
-//             if let Some(values) = items.as_array() {
-//                 for instance in values {
-//                     if let Some(val) = instance.get("name") {
-//                         if let Some(instance_name) = val.as_str() {
-//                             let instance_name = instance_name.to_string();
-//                             instances = build_zone_to_instance_names_map(
-//                                 zone.clone(),
-//                                 instance_name,
-//                                 instances,
-//                             );
-//                         }
-//                     }
-//                 }
-//             }
-//         }
-//     }
-//     Ok(instances)
-// }
-//
-// pub(crate) async fn get_zones_in_region(
-//     project: &str,
-//     region: &String,
-// ) -> anyhow::Result<Vec<String>> {
-//     let auth_token = gcp_auth::get_access_token().await?;
-//     let mut zones = vec![];
-//     let zones_in_region = reqwest::Client::new()
-//         .get(format!(
-//             "{}/compute/v1/projects/{}/zones",
-//             COMPUTE_ENDPOINT, project
-//         ))
-//         .query(&[("filter", format!("name:{}-*", region))])
-//         .header(ACCEPT, "application/json")
-//         .bearer_auth(auth_token)
-//         .send()
-//         .await?
-//         .json::<Value>()
-//         .await?;
-//     if let Some(items) = zones_in_region.get("items") {
-//         if let Some(zones_in_region) = items.as_array() {
-//             for zone in zones_in_region {
-//                 if let Some(z) = zone.get("name") {
-//                     if let Some(z) = z.as_str() {
-//                         zones.push(String::from(z))
-//                     }
-//                 }
-//             }
-//         }
-//     }
-//     Ok(zones)
-// }
