@@ -17,7 +17,7 @@ tokio = { version = "1.40.0", features = ["full"] }
 futures = "0.3.31"
 thiserror = "1.0.64"
 regex = "1.11.0"
-anyhow = "1.0.89"
+anyhow = "1.0.95"
 rand = "0.8.5"
 clap = { version = "4.5.13", features = ["derive"] }
 json-patch = "3.0.1"
