@@ -6,5 +6,10 @@ updates:
       interval: "daily"
     groups:
       all-updates:
+        exclude-groups:
+          - "kube"
+          - "k8s-openapi"
+      kube-updates:
         patterns:
-          - "*"
+          - "kube"
+          - "k8s-openapi"
