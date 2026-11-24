@@ -17,12 +17,12 @@ use crate::api::{
     check_if_health_check_exists, check_if_instance_group_exists,
 };
 use crate::constants::{
-    CLEANUP_NUM_RETRIES, COMPUTE_ENDPOINT, CONTROLLER_NAME, LB_BACKEND_SVC_ANNOTATION_KEY,
+    CLEANUP_NUM_RETRIES, CONTROLLER_NAME, LB_BACKEND_SVC_ANNOTATION_KEY,
     LB_FIREWALL_RULE_ANNOTATION_KEY, LB_FORWARDING_RULE_ANNOTATION_KEY, LB_HC_ANNOTATION_KEY,
     LB_IG_ANNOTATION_KEY,
 };
 use crate::utils::is_svc_type_lb;
-use crate::{utils, Args};
+use crate::{urls, utils, validation, Args};
 use anyhow::{anyhow, Context};
 use clap::Parser;
 use k8s_openapi::api::core::v1::{Service, ServiceStatus};
@@ -33,7 +33,7 @@ use kube::{Api, Client, ResourceExt};
 use log::debug;
 use serde_json::{json, Value};
 use std::borrow::BorrowMut;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 pub(crate) async fn delete_forwarding_rule(
@@ -44,16 +44,25 @@ pub(crate) async fn delete_forwarding_rule(
 ) -> anyhow::Result<()> {
     let mut retries = CLEANUP_NUM_RETRIES;
     let annotations = svc.annotations();
-    if let Some(forwarding_rule) = annotations.get(LB_FORWARDING_RULE_ANNOTATION_KEY) {
+    if let Some(forwarding_rule) =
+        validation::resource_name_annotation(annotations, LB_FORWARDING_RULE_ANNOTATION_KEY)?
+    {
+        let url = urls::compute_url(&[
+            "compute",
+            "beta",
+            "projects",
+            project,
+            "regions",
+            region,
+            "forwardingRules",
+            forwarding_rule,
+        ])?;
         if !check_if_forwarding_rule_exists(&project, &region, forwarding_rule).await? {
             return Ok(());
         }
         while retries != 0 {
             let res = reqwest::Client::new()
-                .delete(format!(
-                    "{}/compute/beta/projects/{}/regions/{}/forwardingRules/{}",
-                    COMPUTE_ENDPOINT, project, region, forwarding_rule
-                ))
+                .delete(&url)
                 .bearer_auth(auth_token)
                 .send()
                 .await?
@@ -87,16 +96,25 @@ pub(crate) async fn delete_backend_svc(
 ) -> anyhow::Result<()> {
     let mut retries = CLEANUP_NUM_RETRIES;
     let annotations = svc.annotations();
-    if let Some(backend_svc) = annotations.get(LB_BACKEND_SVC_ANNOTATION_KEY) {
+    if let Some(backend_svc) =
+        validation::resource_name_annotation(annotations, LB_BACKEND_SVC_ANNOTATION_KEY)?
+    {
+        let url = urls::compute_url(&[
+            "compute",
+            "beta",
+            "projects",
+            project,
+            "regions",
+            region,
+            "backendServices",
+            backend_svc,
+        ])?;
         if !check_if_backend_svc_exists(&project, &region, backend_svc).await? {
             return Ok(());
         }
         while retries != 0 {
             let res = reqwest::Client::new()
-                .delete(format!(
-                    "{}/compute/beta/projects/{}/regions/{}/backendServices/{}",
-                    COMPUTE_ENDPOINT, project, region, backend_svc
-                ))
+                .delete(&url)
                 .bearer_auth(&auth_token)
                 .send()
                 .await?
@@ -130,6 +148,24 @@ pub(crate) async fn delete_instance_groups(
     k8s_client: Client,
 ) -> anyhow::Result<()> {
     let annotations = svc.annotations();
+    let groups = match annotations.get(LB_IG_ANNOTATION_KEY) {
+        Some(backends) => {
+            let parsed: BTreeMap<String, String> =
+                serde_json::from_str(backends).with_context(|| {
+                    format!(
+                        "invalid {} {}: expected JSON object mapping zone to instance group",
+                        LB_IG_ANNOTATION_KEY,
+                        validation::display_untrusted(backends)
+                    )
+                })?;
+            for (zone, group) in &parsed {
+                validation::validate_resource_name(LB_IG_ANNOTATION_KEY, zone)?;
+                validation::validate_resource_name(LB_IG_ANNOTATION_KEY, group)?;
+            }
+            Some(parsed)
+        }
+        None => None,
+    };
     let api: Api<Service> = Api::<Service>::all(k8s_client);
     let lp = ListParams::default().labels(format!("{}=reconcile", CONTROLLER_NAME).as_str());
     if let Ok(res) = api.list(&lp).await {
@@ -138,19 +174,25 @@ pub(crate) async fn delete_instance_groups(
             return Ok(());
         }
     };
-    if let Some(backends) = annotations.get(LB_IG_ANNOTATION_KEY) {
-        let groups: HashMap<_, _> = serde_json::from_str(backends)?;
+    if let Some(groups) = groups {
         'group_delete: for (zone, group) in groups {
+            let url = urls::compute_url(&[
+                "compute",
+                "beta",
+                "projects",
+                project,
+                "zones",
+                &zone,
+                "instanceGroups",
+                &group,
+            ])?;
             let mut retries = CLEANUP_NUM_RETRIES;
             while retries != 0 {
                 if !check_if_instance_group_exists(&project, &zone, &group).await? {
                     continue 'group_delete;
                 }
                 let res = reqwest::Client::new()
-                    .delete(format!(
-                        "{}/compute/beta/projects/{}/zones/{}/instanceGroups/{}",
-                        COMPUTE_ENDPOINT, project, zone, group
-                    ))
+                    .delete(&url)
                     .bearer_auth(auth_token)
                     .send()
                     .await?
@@ -185,16 +227,25 @@ pub(crate) async fn delete_health_check(
 ) -> anyhow::Result<()> {
     let mut retries = CLEANUP_NUM_RETRIES;
     let annotations = svc.annotations();
-    if let Some(health_check) = annotations.get(LB_HC_ANNOTATION_KEY) {
+    if let Some(health_check) =
+        validation::resource_name_annotation(annotations, LB_HC_ANNOTATION_KEY)?
+    {
+        let url = urls::compute_url(&[
+            "compute",
+            "beta",
+            "projects",
+            project,
+            "regions",
+            region,
+            "healthChecks",
+            health_check,
+        ])?;
         if !check_if_health_check_exists(&project, &region, health_check).await? {
             return Ok(());
         }
         while retries != 0 {
             let res = reqwest::Client::new()
-                .delete(format!(
-                    "{}/compute/beta/projects/{}/regions/{}/healthChecks/{}",
-                    COMPUTE_ENDPOINT, project, region, health_check
-                ))
+                .delete(&url)
                 .bearer_auth(auth_token)
                 .send()
                 .await?
@@ -234,16 +285,24 @@ pub(crate) async fn delete_firewall(
         project
     };
     let annotations = svc.annotations();
-    if let Some(fw) = annotations.get(LB_FIREWALL_RULE_ANNOTATION_KEY) {
+    if let Some(fw) =
+        validation::resource_name_annotation(annotations, LB_FIREWALL_RULE_ANNOTATION_KEY)?
+    {
+        let url = urls::compute_url(&[
+            "compute",
+            "beta",
+            "projects",
+            project,
+            "global",
+            "firewalls",
+            fw,
+        ])?;
         if !check_if_firewall_exists(project, fw).await? {
             return Ok(());
         }
         while retries != 0 {
             let res = reqwest::Client::new()
-                .delete(format!(
-                    "{}/compute/beta/projects/{}/global/firewalls/{}",
-                    COMPUTE_ENDPOINT, project, fw
-                ))
+                .delete(&url)
                 .bearer_auth(auth_token)
                 .send()
                 .await?

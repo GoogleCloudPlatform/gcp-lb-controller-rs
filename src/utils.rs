@@ -31,13 +31,12 @@ use std::borrow::BorrowMut;
 use std::sync::Arc;
 
 use crate::constants::{
-    COMPUTE_ENDPOINT, LB_REGIONAL_MIG_ANNOTATION_KEY, LB_ZONAL_MIG_ANNOTATION_KEY,
-};
-use crate::constants::{
     LB_BACKEND_SVC_ANNOTATION_KEY, LB_FIREWALL_RULE_ANNOTATION_KEY,
     LB_FORWARDING_RULE_ANNOTATION_KEY, LB_HC_ANNOTATION_KEY, LB_IG_ANNOTATION_KEY,
     NLB_FIREWALL_CIDR,
 };
+use crate::constants::{LB_REGIONAL_MIG_ANNOTATION_KEY, LB_ZONAL_MIG_ANNOTATION_KEY};
+use crate::urls;
 
 pub(crate) fn get_hc_name_from_target_link(link: &str) -> anyhow::Result<String> {
     debug!("getting health check name from target link: {}", link);
@@ -119,19 +118,32 @@ pub(crate) async fn wait_for_op(
     let mut retries = 4;
     if let Some(operation_id) = res["id"].as_str() {
         while retries != 0 {
-            let mut endpoint = format!(
-                "{}/compute/v1/projects/{}/global/operations/{}/wait",
-                COMPUTE_ENDPOINT, &project, operation_id
-            );
+            let mut endpoint = urls::compute_url(&[
+                "compute",
+                "v1",
+                "projects",
+                project,
+                "global",
+                "operations",
+                operation_id,
+                "wait",
+            ])?;
             let mut payload = json!({
                 "project": project,
                 "operation": operation_id
             });
             if let Some(r) = region {
-                endpoint = format!(
-                    "{}/compute/v1/projects/{}/regions/{}/operations/{}/wait",
-                    COMPUTE_ENDPOINT, &project, r, operation_id
-                );
+                endpoint = urls::compute_url(&[
+                    "compute",
+                    "v1",
+                    "projects",
+                    project,
+                    "regions",
+                    r,
+                    "operations",
+                    operation_id,
+                    "wait",
+                ])?;
                 payload = json!({
                     "project": project,
                     "region": region,
@@ -139,10 +151,17 @@ pub(crate) async fn wait_for_op(
                 });
             }
             if let Some(z) = zone {
-                endpoint = format!(
-                    "{}/compute/v1/projects/{}/zones/{}/operations/{}/wait",
-                    COMPUTE_ENDPOINT, &project, z, operation_id
-                );
+                endpoint = urls::compute_url(&[
+                    "compute",
+                    "v1",
+                    "projects",
+                    project,
+                    "zones",
+                    z,
+                    "operations",
+                    operation_id,
+                    "wait",
+                ])?;
                 payload = json!({
                     "project": project,
                     "zone": zone,
@@ -286,44 +305,69 @@ pub(crate) fn check_if_lb_annotations_exist_on_svc(svc: &Service) -> bool {
     false
 }
 
-pub(crate) fn build_instance_url(project: &String, zone: &String, name: &String) -> String {
-    format!("projects/{}/zones/{}/instances/{}", project, zone, name)
+pub(crate) fn build_instance_url(project: &str, zone: &str, name: &str) -> anyhow::Result<String> {
+    urls::resource_path(&["projects", project, "zones", zone, "instances", name])
 }
 
 pub(crate) fn build_zonal_instance_group_url(
-    project: &String,
-    zone: &String,
-    group_name: &String,
-) -> String {
-    format!(
-        "projects/{}/zones/{}/instanceGroups/{}",
-        project, zone, group_name
-    )
+    project: &str,
+    zone: &str,
+    group_name: &str,
+) -> anyhow::Result<String> {
+    urls::resource_path(&[
+        "projects",
+        project,
+        "zones",
+        zone,
+        "instanceGroups",
+        group_name,
+    ])
 }
 
 pub(crate) fn build_regional_instance_group_url(
-    project: &String,
-    region: &String,
-    group_name: &String,
-) -> String {
-    format!(
-        "projects/{}/regions/{}/instanceGroups/{}",
-        project, region, group_name
-    )
+    project: &str,
+    region: &str,
+    group_name: &str,
+) -> anyhow::Result<String> {
+    urls::resource_path(&[
+        "projects",
+        project,
+        "regions",
+        region,
+        "instanceGroups",
+        group_name,
+    ])
 }
 
-pub(crate) fn build_health_check_url(project: &String, region: &String, name: &String) -> String {
-    format!(
-        "projects/{}/regions/{}/healthChecks/{}",
-        project, region, name
-    )
+pub(crate) fn build_health_check_url(
+    project: &str,
+    region: &str,
+    name: &str,
+) -> anyhow::Result<String> {
+    urls::resource_path(&["projects", project, "regions", region, "healthChecks", name])
 }
 
-pub(crate) fn build_backend_svc_url(project: &String, region: &String, name: &String) -> String {
-    format!(
-        "projects/{}/regions/{}/backendServices/{}",
-        project, region, name
-    )
+pub(crate) fn build_backend_svc_url(
+    project: &str,
+    region: &str,
+    name: &str,
+) -> anyhow::Result<String> {
+    urls::resource_path(&[
+        "projects",
+        project,
+        "regions",
+        region,
+        "backendServices",
+        name,
+    ])
+}
+
+pub(crate) fn build_address_url(project: &str, region: &str, name: &str) -> anyhow::Result<String> {
+    urls::resource_path(&["projects", project, "regions", region, "addresses", name])
+}
+
+pub(crate) fn build_network_url(project: &str, network: &str) -> anyhow::Result<String> {
+    urls::resource_path(&["projects", project, "global", "networks", network])
 }
 
 pub(crate) fn build_firewalls_payload(
@@ -420,7 +464,9 @@ mod tests {
         LB_REGIONAL_MIG_ANNOTATION_KEY, LB_ZONAL_MIG_ANNOTATION_KEY,
     };
     use crate::utils::{
-        build_firewalls_payload, check_backend_svc_prerequisites,
+        build_address_url, build_backend_svc_url, build_firewalls_payload, build_health_check_url,
+        build_instance_url, build_network_url, build_regional_instance_group_url,
+        build_zonal_instance_group_url, check_backend_svc_prerequisites,
         check_if_lb_annotations_exist_on_svc, check_resource_prerequisites,
         get_hc_name_from_target_link, is_svc_type_lb,
     };
@@ -624,6 +670,57 @@ mod tests {
         let result =
             check_backend_svc_prerequisites(&input.name_any(), &input.namespace().unwrap(), &data);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    pub fn build_url_helpers_match_legacy_strings_and_reject_traversal() {
+        let project = String::from("proj-1");
+        let region = String::from("us-central1");
+        let zone = String::from("us-central1-a");
+        let name = String::from("res-1");
+        let traversal = String::from("x/../../../../global/addresses/victim");
+
+        assert_eq!(
+            build_instance_url(&project, &zone, &name).unwrap(),
+            "projects/proj-1/zones/us-central1-a/instances/res-1"
+        );
+        assert!(build_instance_url(&project, &zone, &traversal).is_err());
+
+        assert_eq!(
+            build_zonal_instance_group_url(&project, &zone, &name).unwrap(),
+            "projects/proj-1/zones/us-central1-a/instanceGroups/res-1"
+        );
+        assert!(build_zonal_instance_group_url(&project, &traversal, &name).is_err());
+
+        assert_eq!(
+            build_regional_instance_group_url(&project, &region, &name).unwrap(),
+            "projects/proj-1/regions/us-central1/instanceGroups/res-1"
+        );
+        assert!(build_regional_instance_group_url(&project, &region, &traversal).is_err());
+
+        assert_eq!(
+            build_health_check_url(&project, &region, &name).unwrap(),
+            "projects/proj-1/regions/us-central1/healthChecks/res-1"
+        );
+        assert!(build_health_check_url(&project, &region, &traversal).is_err());
+
+        assert_eq!(
+            build_backend_svc_url(&project, &region, &name).unwrap(),
+            "projects/proj-1/regions/us-central1/backendServices/res-1"
+        );
+        assert!(build_backend_svc_url(&project, &region, &traversal).is_err());
+
+        assert_eq!(
+            build_address_url(&project, &region, &name).unwrap(),
+            "projects/proj-1/regions/us-central1/addresses/res-1"
+        );
+        assert!(build_address_url(&project, &region, &traversal).is_err());
+
+        assert_eq!(
+            build_network_url(&project, &name).unwrap(),
+            "projects/proj-1/global/networks/res-1"
+        );
+        assert!(build_network_url(&project, &traversal).is_err());
     }
 
     fn create_test_svc(data: &BTreeMap<String, String>) -> Service {

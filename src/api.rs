@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use anyhow::anyhow;
+use anyhow::{anyhow, Context};
 use clap::Parser;
 use k8s_openapi::api::core::v1::Service;
 use kube::{Client, ResourceExt};
@@ -26,21 +26,21 @@ use std::sync::Arc;
 
 use crate::cleanup::delete_forwarding_rule;
 use crate::constants::{
-    COMPUTE_ENDPOINT, CONTROLLER_NAME, LB_BACKEND_SVC_ANNOTATION_KEY,
-    LB_FIREWALL_RULE_ANNOTATION_KEY, LB_FORWARDING_RULE_ANNOTATION_KEY, LB_HC_ANNOTATION_KEY,
-    LB_HC_PORT_ANNOTATION_KEY, LB_IG_ANNOTATION_KEY, LB_REGIONAL_MIG_ANNOTATION_KEY,
-    LB_STATIC_IP_ANNOTATION_KEY, LB_ZONAL_MIG_ANNOTATION_KEY,
+    CONTROLLER_NAME, LB_BACKEND_SVC_ANNOTATION_KEY, LB_FIREWALL_RULE_ANNOTATION_KEY,
+    LB_FORWARDING_RULE_ANNOTATION_KEY, LB_HC_ANNOTATION_KEY, LB_HC_PORT_ANNOTATION_KEY,
+    LB_IG_ANNOTATION_KEY, LB_REGIONAL_MIG_ANNOTATION_KEY, LB_STATIC_IP_ANNOTATION_KEY,
+    LB_ZONAL_MIG_ANNOTATION_KEY,
 };
 use crate::errors::Error::ControllerError;
-use crate::{gcp_auth, utils, Args};
+use crate::{gcp_auth, urls, utils, validation, Args};
 
 pub(crate) async fn create_tcp_hc(
     service_name: &String,
     service_ns: &String,
     port: i32,
     region: &String,
-    hc_name: &String,
-    firewall_rule: &String,
+    hc_name: Option<&String>,
+    firewall_rule: Option<&String>,
     k8s_client: &Client,
 ) -> anyhow::Result<()> {
     let project = gcp_auth::get_project_id().await?;
@@ -50,7 +50,7 @@ pub(crate) async fn create_tcp_hc(
         CONTROLLER_NAME, service_ns, service_name
     );
 
-    if !firewall_rule.is_empty() {
+    if let Some(firewall_rule) = firewall_rule {
         debug!(
             "firewall rule annotation exists, updating: {}",
             firewall_rule
@@ -75,7 +75,7 @@ pub(crate) async fn create_tcp_hc(
         .await?;
     }
 
-    if !hc_name.is_empty() {
+    if let Some(hc_name) = hc_name {
         debug!("health check annotation exists, updating: {}", hc_name);
         verify_and_update_hc(
             hc_name,
@@ -89,10 +89,15 @@ pub(crate) async fn create_tcp_hc(
         .await?;
     } else {
         let res = reqwest::Client::new()
-            .post(format!(
-                "{}/compute/v1/projects/{}/regions/{}/healthChecks",
-                COMPUTE_ENDPOINT, project, region
-            ))
+            .post(urls::compute_url(&[
+                "compute",
+                "v1",
+                "projects",
+                &project,
+                "regions",
+                region,
+                "healthChecks",
+            ])?)
             .header(ACCEPT, "application/json")
             .bearer_auth(&auth_token)
             .json(&json!({
@@ -141,19 +146,20 @@ pub(crate) async fn process_health_checks(
     let service_name = &svc.name_any();
     let service_ns = &svc.namespace().unwrap();
 
-    let empty_string = Some(String::from(""));
-    let hc_name = svc_annotations
-        .get(LB_HC_ANNOTATION_KEY)
-        .or(empty_string.as_ref())
-        .unwrap();
-    let firewall_rule = svc_annotations
-        .get(LB_FIREWALL_RULE_ANNOTATION_KEY)
-        .or(empty_string.as_ref())
-        .unwrap();
+    let hc_name = validation::resource_name_annotation(svc_annotations, LB_HC_ANNOTATION_KEY)?;
+    let firewall_rule =
+        validation::resource_name_annotation(svc_annotations, LB_FIREWALL_RULE_ANNOTATION_KEY)?;
 
     if svc_annotations.contains_key(LB_HC_PORT_ANNOTATION_KEY) {
         if let Some(port) = svc_annotations.get(LB_HC_PORT_ANNOTATION_KEY) {
-            let port = port.parse()?;
+            let port = port.parse().map_err(|err| {
+                anyhow!(
+                    "invalid {} {}: expected valid port integer ({})",
+                    LB_HC_PORT_ANNOTATION_KEY,
+                    validation::display_untrusted(port),
+                    err
+                )
+            })?;
             let node_port = utils::get_node_port(port, &svc)?;
             create_tcp_hc(
                 service_name,
@@ -205,11 +211,18 @@ async fn verify_and_update_hc(
     let project = gcp_auth::get_project_id().await?;
     let auth_token = gcp_auth::get_access_token().await?;
 
+    let url = urls::compute_url(&[
+        "compute",
+        "v1",
+        "projects",
+        &project,
+        "regions",
+        region,
+        "healthChecks",
+        hc_name,
+    ])?;
     let res = reqwest::Client::new()
-        .put(format!(
-            "{}/compute/v1/projects/{}/regions/{}/healthChecks/{}",
-            COMPUTE_ENDPOINT, project, region, hc_name
-        ))
+        .put(&url)
         .header(ACCEPT, "application/json")
         .bearer_auth(&auth_token)
         .json(&json!({
@@ -258,16 +271,20 @@ async fn create_firewall_rule(
         gcp_auth::get_project_id().await?
     };
     let res = reqwest::Client::new()
-        .post(format!(
-            "{}/compute/v1/projects/{}/global/firewalls",
-            COMPUTE_ENDPOINT, &project
-        ))
+        .post(urls::compute_url(&[
+            "compute",
+            "v1",
+            "projects",
+            &project,
+            "global",
+            "firewalls",
+        ])?)
         .header(ACCEPT, "application/json")
         .bearer_auth(&auth_token)
         .json(&utils::build_firewalls_payload(
             format!("fw-{}-{}-{}", svc_ns, svc_name, utils::random_string()),
             description,
-            format!("projects/{}/global/networks/{}", project, network),
+            utils::build_network_url(&project, &network)?,
             ports,
         )?)
         .send()
@@ -314,17 +331,23 @@ async fn update_firewall_rule(
     } else {
         gcp_auth::get_project_id().await?
     };
+    let url = urls::compute_url(&[
+        "compute",
+        "v1",
+        "projects",
+        &project,
+        "global",
+        "firewalls",
+        firewall_rule,
+    ])?;
     let res = reqwest::Client::new()
-        .put(format!(
-            "{}/compute/v1/projects/{}/global/firewalls/{}",
-            COMPUTE_ENDPOINT, &project, firewall_rule
-        ))
+        .put(&url)
         .header(ACCEPT, "application/json")
         .bearer_auth(&auth_token)
         .json(&utils::build_firewalls_payload(
             String::from(firewall_rule),
             description,
-            format!("projects/{}/global/networks/{}", project, network),
+            utils::build_network_url(&project, &network)?,
             ports,
         )?)
         .send()
@@ -418,10 +441,15 @@ async fn create_instance_group(
     description: &String,
 ) -> anyhow::Result<()> {
     let res = reqwest::Client::new()
-        .post(format!(
-            "{}/compute/v1/projects/{}/zones/{}/instanceGroups",
-            COMPUTE_ENDPOINT, &project, zone
-        ))
+        .post(urls::compute_url(&[
+            "compute",
+            "v1",
+            "projects",
+            project,
+            "zones",
+            zone,
+            "instanceGroups",
+        ])?)
         .header(ACCEPT, "application/json")
         .bearer_auth(&auth_token)
         .json(&json!({
@@ -461,7 +489,7 @@ pub(crate) async fn add_instances_to_instance_group(
         let payload = json!({
             "instances": [
             {
-                "instance": utils::build_instance_url(project, zone, instance_name)
+                "instance": utils::build_instance_url(project, zone, instance_name)?
             }
         ]});
         debug!(
@@ -471,10 +499,17 @@ pub(crate) async fn add_instances_to_instance_group(
             serde_json::to_string(&payload)?
         );
         let res = reqwest::Client::new()
-            .post(format!(
-                "{}/compute/v1/projects/{}/zones/{}/instanceGroups/{}/addInstances",
-                COMPUTE_ENDPOINT, project, zone, instance_group
-            ))
+            .post(urls::compute_url(&[
+                "compute",
+                "v1",
+                "projects",
+                project,
+                "zones",
+                zone,
+                "instanceGroups",
+                instance_group,
+                "addInstances",
+            ])?)
             .header(ACCEPT, "application/json")
             .bearer_auth(auth_token)
             .json(&payload)
@@ -514,14 +549,25 @@ pub(crate) async fn process_backend_service(
     let auth_token = gcp_auth::get_access_token().await?;
     let service_name = &svc.name_any();
     let service_ns = &svc.namespace().unwrap();
-    let hc_name = annotations.get(LB_HC_ANNOTATION_KEY).unwrap();
+    let hc_name = validation::resource_name_annotation(annotations, LB_HC_ANNOTATION_KEY)?
+        .ok_or_else(|| {
+            anyhow!(
+                "{} annotation does not exist for service: {}/{}",
+                LB_HC_ANNOTATION_KEY,
+                service_ns,
+                service_name
+            )
+        })?;
+    let backend_svc =
+        validation::resource_name_annotation(annotations, LB_BACKEND_SVC_ANNOTATION_KEY)?;
     let description = format!(
         "{}/service: {}/{}",
         CONTROLLER_NAME, service_ns, service_name
     );
 
     let backends = build_backends(region, annotations, &project, service_name, service_ns)?;
-    if let Some(backend_svc) = annotations.get(LB_BACKEND_SVC_ANNOTATION_KEY) {
+    let hc_url = utils::build_health_check_url(&project, region, hc_name)?;
+    if let Some(backend_svc) = backend_svc {
         debug!(
             "backend service annotation exists, updating: {}",
             backend_svc
@@ -531,18 +577,25 @@ pub(crate) async fn process_backend_service(
             "description": description,
             "protocol": "TCP",
             "backends": backends,
-            "healthChecks": [utils::build_health_check_url(&project, region, hc_name)],
+            "healthChecks": [hc_url],
             "loadBalancingScheme": "EXTERNAL"
         });
         debug!(
             "update backend service payload: {}",
             serde_json::to_string(&update_payload)?
         );
+        let backend_svc_url = urls::compute_url(&[
+            "compute",
+            "beta",
+            "projects",
+            &project,
+            "regions",
+            region,
+            "backendServices",
+            backend_svc,
+        ])?;
         let res = reqwest::Client::new()
-            .patch(format!(
-                "{}/compute/beta/projects/{}/regions/{}/backendServices/{}",
-                COMPUTE_ENDPOINT, project, region, backend_svc
-            ))
+            .patch(&backend_svc_url)
             .header(ACCEPT, "application/json")
             .bearer_auth(&auth_token)
             .json(&update_payload)
@@ -570,7 +623,7 @@ pub(crate) async fn process_backend_service(
             "description": description,
             "protocol": "TCP",
             "backends": backends,
-            "healthChecks": [utils::build_health_check_url(&project, region, hc_name)],
+            "healthChecks": [hc_url],
             "loadBalancingScheme": "EXTERNAL"
         });
         debug!(
@@ -578,10 +631,15 @@ pub(crate) async fn process_backend_service(
             serde_json::to_string(&create_payload)?
         );
         let res = reqwest::Client::new()
-            .post(format!(
-                "{}/compute/beta/projects/{}/regions/{}/backendServices",
-                COMPUTE_ENDPOINT, project, region
-            ))
+            .post(urls::compute_url(&[
+                "compute",
+                "beta",
+                "projects",
+                &project,
+                "regions",
+                region,
+                "backendServices",
+            ])?)
             .header(ACCEPT, "application/json")
             .bearer_auth(&auth_token)
             .json(&create_payload)
@@ -612,52 +670,56 @@ pub(crate) async fn process_backend_service(
 }
 
 fn build_backends(
-    region: &String,
+    region: &str,
     annotations: &BTreeMap<String, String>,
-    project: &String,
-    service_name: &String,
-    service_ns: &String,
+    project: &str,
+    service_name: &str,
+    service_ns: &str,
 ) -> anyhow::Result<Vec<HashMap<String, String>>> {
     if let Some(unmanaged_ig) = annotations.get(LB_IG_ANNOTATION_KEY) {
         debug!(
             "using zonal unmanaged instance groups for service: {}/{}",
             service_ns, service_name
         );
-        return Ok(build_zonal_instance_group_backends(
-            &project,
-            &service_ns,
-            &service_name,
+        return build_zonal_instance_group_backends(
+            project,
+            service_ns,
+            service_name,
+            LB_IG_ANNOTATION_KEY,
             unmanaged_ig,
-        )?);
+        );
     }
     if let Some(zonal_ig) = annotations.get(LB_ZONAL_MIG_ANNOTATION_KEY) {
         debug!(
             "using zonal managed instance groups for service: {}/{}",
             service_ns, service_name
         );
-        return Ok(build_zonal_instance_group_backends(
-            &project,
-            &service_ns,
-            &service_name,
+        return build_zonal_instance_group_backends(
+            project,
+            service_ns,
+            service_name,
+            LB_ZONAL_MIG_ANNOTATION_KEY,
             zonal_ig,
-        )?);
+        );
     }
     let mut backends = vec![];
     if let Some(managed_ig) = annotations.get(LB_REGIONAL_MIG_ANNOTATION_KEY) {
-        managed_ig.split(",").for_each(|group| {
+        for group in managed_ig.split(',') {
+            validation::validate_resource_name(LB_REGIONAL_MIG_ANNOTATION_KEY, group)?;
+            let group_name = group.to_string();
             let mut backend = HashMap::<String, String>::new();
             backend.insert(
                 String::from("group"),
-                utils::build_regional_instance_group_url(&project, region, &group.to_string()),
+                utils::build_regional_instance_group_url(project, region, &group_name)?,
             );
             backend.insert(String::from("balancingMode"), String::from("CONNECTION"));
             backends.push(backend);
-        });
+        }
         debug!(
             "using provided regional managed instance groups for service: {}/{} count: {}",
             service_ns,
             service_name,
-            backends.iter().count()
+            backends.len()
         );
     }
     if backends.is_empty() {
@@ -671,18 +733,28 @@ fn build_backends(
 }
 
 fn build_zonal_instance_group_backends(
-    project: &String,
-    svc_ns: &String,
-    svc_name: &String,
-    instance_groups: &String,
+    project: &str,
+    svc_ns: &str,
+    svc_name: &str,
+    annotation_key: &str,
+    instance_groups: &str,
 ) -> anyhow::Result<Vec<HashMap<String, String>>> {
     let mut backends = vec![];
-    let groups: HashMap<String, String> = serde_json::from_str(instance_groups)?;
+    let groups: BTreeMap<String, String> =
+        serde_json::from_str(instance_groups).with_context(|| {
+            format!(
+                "invalid {} {}: expected JSON object mapping zone to instance group",
+                annotation_key,
+                validation::display_untrusted(instance_groups)
+            )
+        })?;
     for (zone, group_name) in groups {
+        validation::validate_resource_name(annotation_key, &zone)?;
+        validation::validate_resource_name(annotation_key, &group_name)?;
         let mut backend = HashMap::<String, String>::new();
         backend.insert(
             String::from("group"),
-            utils::build_zonal_instance_group_url(&project, &zone, &group_name),
+            utils::build_zonal_instance_group_url(project, &zone, &group_name)?,
         );
         backend.insert(String::from("balancingMode"), String::from("CONNECTION"));
         backends.push(backend);
@@ -691,7 +763,7 @@ fn build_zonal_instance_group_backends(
         "number of zonal instance groups for service: {}/{} count: {}",
         svc_ns,
         svc_name,
-        backends.iter().count()
+        backends.len()
     );
     Ok(backends)
 }
@@ -704,8 +776,12 @@ pub(crate) async fn process_forwarding_rule(
 ) -> anyhow::Result<()> {
     let project = gcp_auth::get_project_id().await?;
     let auth_token = gcp_auth::get_access_token().await?;
-    if let Some(forwarding_rule) = annotations.get(LB_FORWARDING_RULE_ANNOTATION_KEY) {
-        if let Some(name) = annotations.get(LB_STATIC_IP_ANNOTATION_KEY) {
+    let forwarding_rule =
+        validation::resource_name_annotation(annotations, LB_FORWARDING_RULE_ANNOTATION_KEY)?;
+    let static_ip_name =
+        validation::resource_name_annotation(annotations, LB_STATIC_IP_ANNOTATION_KEY)?;
+    if let Some(forwarding_rule) = forwarding_rule {
+        if let Some(name) = static_ip_name {
             let forwarding_rule_ip =
                 get_forwarding_rule_ip_address(&project, region, forwarding_rule).await?;
             let static_ip = get_ip_addr(name, &project, &auth_token, Some(region)).await?;
@@ -737,7 +813,18 @@ pub(crate) async fn create_forwarding_rule(
 ) -> anyhow::Result<()> {
     let service_name = &svc.name_any();
     let service_ns = &svc.namespace().unwrap();
-    let backend_svc = annotations.get(LB_BACKEND_SVC_ANNOTATION_KEY).unwrap();
+    let backend_svc =
+        validation::resource_name_annotation(annotations, LB_BACKEND_SVC_ANNOTATION_KEY)?
+            .ok_or_else(|| {
+                anyhow!(
+                    "{} annotation does not exist for service: {}/{}",
+                    LB_BACKEND_SVC_ANNOTATION_KEY,
+                    service_ns,
+                    service_name
+                )
+            })?;
+    let static_ip_name =
+        validation::resource_name_annotation(annotations, LB_STATIC_IP_ANNOTATION_KEY)?;
     let description = format!(
         "{}/service: {}/{}",
         CONTROLLER_NAME, service_ns, service_name
@@ -750,14 +837,15 @@ pub(crate) async fn create_forwarding_rule(
         .flatten()
         .map(|t| t.port)
         .collect::<Vec<_>>();
-    let payload = match annotations.get(LB_STATIC_IP_ANNOTATION_KEY) {
+    let backend_svc_url = utils::build_backend_svc_url(project, region, backend_svc)?;
+    let payload = match static_ip_name {
         Some(name) => json!({
             "name": format!("forwarding-rule-{}-{}-{}", service_ns, service_name, utils::random_string()),
             "description": description,
             "IPProtocol": "TCP",
-            "IPAddress":  format!("projects/{}/regions/{}/addresses/{}", &project, &region, name),
+            "IPAddress": utils::build_address_url(project, region, name)?,
             "loadBalancingScheme": "EXTERNAL",
-            "backendService": utils::build_backend_svc_url(&project, region, backend_svc),
+            "backendService": backend_svc_url,
             "ports": ports
         }),
         None => json!({
@@ -765,7 +853,7 @@ pub(crate) async fn create_forwarding_rule(
             "description": description,
             "IPProtocol": "TCP",
             "loadBalancingScheme": "EXTERNAL",
-            "backendService": utils::build_backend_svc_url(&project, region, backend_svc),
+            "backendService": backend_svc_url,
             "ports": ports
         }),
     };
@@ -774,10 +862,15 @@ pub(crate) async fn create_forwarding_rule(
         serde_json::to_string_pretty(&payload)?
     );
     let res = reqwest::Client::new()
-        .post(format!(
-            "{}/compute/beta/projects/{}/regions/{}/forwardingRules",
-            COMPUTE_ENDPOINT, project, region
-        ))
+        .post(urls::compute_url(&[
+            "compute",
+            "beta",
+            "projects",
+            project,
+            "regions",
+            region,
+            "forwardingRules",
+        ])?)
         .header(ACCEPT, "application/json")
         .bearer_auth(&auth_token)
         .json(&payload)
@@ -814,16 +907,22 @@ pub(crate) async fn create_forwarding_rule(
 }
 
 pub(crate) async fn check_if_forwarding_rule_exists(
-    project: &String,
-    region: &String,
-    forwarding_rule: &String,
+    project: &str,
+    region: &str,
+    forwarding_rule: &str,
 ) -> anyhow::Result<bool> {
     let auth_token = gcp_auth::get_access_token().await?;
     let status_code = reqwest::Client::new()
-        .get(format!(
-            "{}/compute/beta/projects/{}/regions/{}/forwardingRules/{}",
-            COMPUTE_ENDPOINT, project, region, forwarding_rule
-        ))
+        .get(urls::compute_url(&[
+            "compute",
+            "beta",
+            "projects",
+            project,
+            "regions",
+            region,
+            "forwardingRules",
+            forwarding_rule,
+        ])?)
         .header(ACCEPT, "application/json")
         .bearer_auth(&auth_token)
         .send()
@@ -836,16 +935,22 @@ pub(crate) async fn check_if_forwarding_rule_exists(
 }
 
 pub(crate) async fn check_if_backend_svc_exists(
-    project: &String,
-    region: &String,
-    backend_svc: &String,
+    project: &str,
+    region: &str,
+    backend_svc: &str,
 ) -> anyhow::Result<bool> {
     let auth_token = gcp_auth::get_access_token().await?;
     let status_code = reqwest::Client::new()
-        .get(format!(
-            "{}/compute/beta/projects/{}/regions/{}/backendServices/{}",
-            COMPUTE_ENDPOINT, project, region, backend_svc
-        ))
+        .get(urls::compute_url(&[
+            "compute",
+            "beta",
+            "projects",
+            project,
+            "regions",
+            region,
+            "backendServices",
+            backend_svc,
+        ])?)
         .header(ACCEPT, "application/json")
         .bearer_auth(&auth_token)
         .send()
@@ -858,16 +963,22 @@ pub(crate) async fn check_if_backend_svc_exists(
 }
 
 pub(crate) async fn check_if_instance_group_exists(
-    project: &String,
-    zone: &String,
-    group: &String,
+    project: &str,
+    zone: &str,
+    group: &str,
 ) -> anyhow::Result<bool> {
     let auth_token = gcp_auth::get_access_token().await?;
     let status_code = reqwest::Client::new()
-        .get(format!(
-            "{}/compute/beta/projects/{}/zones/{}/instanceGroups/{}",
-            COMPUTE_ENDPOINT, project, zone, group
-        ))
+        .get(urls::compute_url(&[
+            "compute",
+            "beta",
+            "projects",
+            project,
+            "zones",
+            zone,
+            "instanceGroups",
+            group,
+        ])?)
         .header(ACCEPT, "application/json")
         .bearer_auth(&auth_token)
         .send()
@@ -880,17 +991,24 @@ pub(crate) async fn check_if_instance_group_exists(
 }
 
 pub(crate) async fn check_if_all_instances_exist_in_instance_group(
-    project: &String,
-    zone: &String,
-    group: &String,
+    project: &str,
+    zone: &str,
+    group: &str,
     instances: &Vec<String>,
 ) -> anyhow::Result<bool> {
     let auth_token = gcp_auth::get_access_token().await?;
     let res = reqwest::Client::new()
-        .post(format!(
-            "{}/compute/beta/projects/{}/zones/{}/instanceGroups/{}/listInstances",
-            COMPUTE_ENDPOINT, project, zone, group
-        ))
+        .post(urls::compute_url(&[
+            "compute",
+            "beta",
+            "projects",
+            project,
+            "zones",
+            zone,
+            "instanceGroups",
+            group,
+            "listInstances",
+        ])?)
         .header(ACCEPT, "application/json")
         .bearer_auth(&auth_token)
         .json(&json!({
@@ -918,16 +1036,22 @@ pub(crate) async fn check_if_all_instances_exist_in_instance_group(
 }
 
 pub(crate) async fn check_if_health_check_exists(
-    project: &String,
-    region: &String,
-    hc_name: &String,
+    project: &str,
+    region: &str,
+    hc_name: &str,
 ) -> anyhow::Result<bool> {
     let auth_token = gcp_auth::get_access_token().await?;
     let status_code = reqwest::Client::new()
-        .get(format!(
-            "{}/compute/v1/projects/{}/regions/{}/healthChecks/{}",
-            COMPUTE_ENDPOINT, project, region, hc_name
-        ))
+        .get(urls::compute_url(&[
+            "compute",
+            "v1",
+            "projects",
+            project,
+            "regions",
+            region,
+            "healthChecks",
+            hc_name,
+        ])?)
         .header(ACCEPT, "application/json")
         .bearer_auth(&auth_token)
         .send()
@@ -939,16 +1063,18 @@ pub(crate) async fn check_if_health_check_exists(
     }
 }
 
-pub(crate) async fn check_if_firewall_exists(
-    project: &String,
-    fw: &String,
-) -> anyhow::Result<bool> {
+pub(crate) async fn check_if_firewall_exists(project: &str, fw: &str) -> anyhow::Result<bool> {
     let auth_token = gcp_auth::get_access_token().await?;
     let status_code = reqwest::Client::new()
-        .get(format!(
-            "{}/compute/v1/projects/{}/global/firewalls/{}",
-            COMPUTE_ENDPOINT, project, fw
-        ))
+        .get(urls::compute_url(&[
+            "compute",
+            "v1",
+            "projects",
+            project,
+            "global",
+            "firewalls",
+            fw,
+        ])?)
         .header(ACCEPT, "application/json")
         .bearer_auth(&auth_token)
         .send()
@@ -961,16 +1087,22 @@ pub(crate) async fn check_if_firewall_exists(
 }
 
 pub(crate) async fn get_forwarding_rule_ip_address(
-    project: &String,
-    region: &String,
-    forwarding_rule: &String,
+    project: &str,
+    region: &str,
+    forwarding_rule: &str,
 ) -> anyhow::Result<String> {
     let auth_token = gcp_auth::get_access_token().await?;
     let res = reqwest::Client::new()
-        .get(format!(
-            "{}/compute/beta/projects/{}/regions/{}/forwardingRules/{}",
-            COMPUTE_ENDPOINT, project, region, forwarding_rule
-        ))
+        .get(urls::compute_url(&[
+            "compute",
+            "beta",
+            "projects",
+            project,
+            "regions",
+            region,
+            "forwardingRules",
+            forwarding_rule,
+        ])?)
         .header(ACCEPT, "application/json")
         .bearer_auth(&auth_token)
         .send()
@@ -988,23 +1120,30 @@ pub(crate) async fn get_forwarding_rule_ip_address(
 
 pub(crate) async fn get_ip_addr(
     name: &String,
-    project: &String,
+    project: &str,
     auth_token: &String,
     region: Option<&String>,
 ) -> anyhow::Result<String> {
     let endpoint = match region {
-        Some(r) => {
-            format!(
-                "{}/compute/v1/projects/{}/regions/{}/addresses/{}",
-                COMPUTE_ENDPOINT, project, r, name
-            )
-        }
-        None => {
-            format!(
-                "{}/compute/v1/projects/{}/global/addresses/{}",
-                COMPUTE_ENDPOINT, project, name
-            )
-        }
+        Some(r) => urls::compute_url(&[
+            "compute",
+            "v1",
+            "projects",
+            project,
+            "regions",
+            r,
+            "addresses",
+            name,
+        ])?,
+        None => urls::compute_url(&[
+            "compute",
+            "v1",
+            "projects",
+            project,
+            "global",
+            "addresses",
+            name,
+        ])?,
     };
     let res = reqwest::Client::new()
         .get(endpoint)
