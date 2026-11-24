@@ -27,6 +27,13 @@ This controller is for Kubernetes environments and provisions GCP loadbalancer i
 2. Add the label `gcp-lb-controller=reconcile` to the services to enable provisioning the load balancer using the controller.
 3. Debug logs can be enabled by setting the environment variable `RUST_LOG=debug`.
 
+### Security model
+
+- **Untrusted annotations:** All `Service` annotations and labels are treated as untrusted input because any user with permission to create or patch a `Service` in a namespace can set them. Every annotation value is validated against its expected syntax before use, and malformed values fail reconciliation rather than being ignored.
+- **Ownership marker:** Every GCP resource created by the controller is tagged with `description: "gcp-lb-controller/service: <namespace>/<name>"`. Before updating, referencing, or deleting any controller-managed resource named by the controller's state annotations (`gcp-lb-controller/health-check`, `gcp-lb-controller/firewall-rule`, `gcp-lb-controller/backend-svc`, `gcp-lb-controller/forwarding-rule`, `gcp-lb-controller/instance-groups`), the controller fetches the resource from the Compute Engine API and verifies that its `description` matches the `Service` (or, for shared node instance groups, carries a controller ownership marker). The controller also refuses to use an existing unmanaged instance group named `lb-ig-<zone>` that does not carry its ownership marker; rename or remove that group to recover.
+- **Do not edit resource descriptions:** Do not manually edit or clear the `description` field on GCP resources managed by this controller, and do not copy `gcp-lb-controller/*` state annotations (`health-check`, `firewall-rule`, `backend-svc`, `forwarding-rule`, `instance-groups`) onto another `Service`.
+- **Recovering from an ownership error:** If reconciliation or cleanup fails with an ownership verification error, inspect the `Service` annotations and the target GCP resource. If the `Service` has a stale or copied state annotation pointing to another resource, update the annotation to the resource owned by `<namespace>/<name>` or remove the state annotation so the controller provisions a dedicated resource. If an operator modified the GCP resource's `description` by mistake, restore `gcp-lb-controller/service: <namespace>/<name>` on the GCP resource.
+
 ## Tools:
 
 1. [Rust](https://www.rust-lang.org/learn/get-started)

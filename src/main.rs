@@ -21,6 +21,7 @@ mod constants;
 mod controller;
 mod errors;
 mod gcp_auth;
+mod ownership;
 mod urls;
 mod utils;
 mod validation;

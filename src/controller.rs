@@ -158,7 +158,8 @@ pub(crate) async fn cleanup(svc: Arc<Service>, ctx: Arc<Ctx>) -> Result<Action> 
         let auth_token = gcp_auth::get_access_token().await?;
         cleanup::delete_forwarding_rule(&svc, &project, &auth_token, &region).await?;
         cleanup::delete_backend_svc(&svc, &project, &auth_token, &region).await?;
-        cleanup::delete_instance_groups(&svc, &project, &auth_token, ctx.client.clone()).await?;
+        cleanup::delete_instance_groups(&svc, &project, &auth_token, &region, ctx.client.clone())
+            .await?;
         cleanup::delete_health_check(&svc, &project, &auth_token, &region).await?;
         cleanup::delete_firewall(&svc, &project, &auth_token).await?;
         cleanup::reset_svc(&svc, &ctx.client.clone()).await?;

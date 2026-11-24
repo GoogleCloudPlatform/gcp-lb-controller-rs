@@ -12,17 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::api::{
-    check_if_backend_svc_exists, check_if_firewall_exists, check_if_forwarding_rule_exists,
-    check_if_health_check_exists, check_if_instance_group_exists,
-};
 use crate::constants::{
     CLEANUP_NUM_RETRIES, CONTROLLER_NAME, LB_BACKEND_SVC_ANNOTATION_KEY,
     LB_FIREWALL_RULE_ANNOTATION_KEY, LB_FORWARDING_RULE_ANNOTATION_KEY, LB_HC_ANNOTATION_KEY,
     LB_IG_ANNOTATION_KEY,
 };
+use crate::ownership::Owner;
 use crate::utils::is_svc_type_lb;
-use crate::{urls, utils, validation, Args};
+use crate::{ownership, urls, utils, validation, Args};
 use anyhow::{anyhow, Context};
 use clap::Parser;
 use k8s_openapi::api::core::v1::{Service, ServiceStatus};
@@ -47,6 +44,8 @@ pub(crate) async fn delete_forwarding_rule(
     if let Some(forwarding_rule) =
         validation::resource_name_annotation(annotations, LB_FORWARDING_RULE_ANNOTATION_KEY)?
     {
+        let service_ns = svc.namespace().unwrap();
+        let service_name = svc.name_any();
         let url = urls::compute_url(&[
             "compute",
             "beta",
@@ -57,7 +56,18 @@ pub(crate) async fn delete_forwarding_rule(
             "forwardingRules",
             forwarding_rule,
         ])?;
-        if !check_if_forwarding_rule_exists(&project, &region, forwarding_rule).await? {
+        if ownership::get_owned_resource(
+            &url,
+            auth_token,
+            Owner::Service {
+                namespace: &service_ns,
+                name: &service_name,
+            },
+            LB_FORWARDING_RULE_ANNOTATION_KEY,
+        )
+        .await?
+        .is_none()
+        {
             return Ok(());
         }
         while retries != 0 {
@@ -99,6 +109,8 @@ pub(crate) async fn delete_backend_svc(
     if let Some(backend_svc) =
         validation::resource_name_annotation(annotations, LB_BACKEND_SVC_ANNOTATION_KEY)?
     {
+        let service_ns = svc.namespace().unwrap();
+        let service_name = svc.name_any();
         let url = urls::compute_url(&[
             "compute",
             "beta",
@@ -109,7 +121,18 @@ pub(crate) async fn delete_backend_svc(
             "backendServices",
             backend_svc,
         ])?;
-        if !check_if_backend_svc_exists(&project, &region, backend_svc).await? {
+        if ownership::get_owned_resource(
+            &url,
+            auth_token,
+            Owner::Service {
+                namespace: &service_ns,
+                name: &service_name,
+            },
+            LB_BACKEND_SVC_ANNOTATION_KEY,
+        )
+        .await?
+        .is_none()
+        {
             return Ok(());
         }
         while retries != 0 {
@@ -145,25 +168,14 @@ pub(crate) async fn delete_instance_groups(
     svc: &Arc<Service>,
     project: &String,
     auth_token: &String,
+    region: &str,
     k8s_client: Client,
 ) -> anyhow::Result<()> {
     let annotations = svc.annotations();
     let groups = match annotations.get(LB_IG_ANNOTATION_KEY) {
-        Some(backends) => {
-            let parsed: BTreeMap<String, String> =
-                serde_json::from_str(backends).with_context(|| {
-                    format!(
-                        "invalid {} {}: expected JSON object mapping zone to instance group",
-                        LB_IG_ANNOTATION_KEY,
-                        validation::display_untrusted(backends)
-                    )
-                })?;
-            for (zone, group) in &parsed {
-                validation::validate_resource_name(LB_IG_ANNOTATION_KEY, zone)?;
-                validation::validate_resource_name(LB_IG_ANNOTATION_KEY, group)?;
-            }
-            Some(parsed)
-        }
+        Some(backends) => Some(validation::parse_controller_instance_groups(
+            backends, region,
+        )?),
         None => None,
     };
     let api: Api<Service> = Api::<Service>::all(k8s_client);
@@ -188,7 +200,15 @@ pub(crate) async fn delete_instance_groups(
             ])?;
             let mut retries = CLEANUP_NUM_RETRIES;
             while retries != 0 {
-                if !check_if_instance_group_exists(&project, &zone, &group).await? {
+                if ownership::get_owned_resource(
+                    &url,
+                    auth_token,
+                    Owner::AnyService,
+                    LB_IG_ANNOTATION_KEY,
+                )
+                .await?
+                .is_none()
+                {
                     continue 'group_delete;
                 }
                 let res = reqwest::Client::new()
@@ -230,6 +250,8 @@ pub(crate) async fn delete_health_check(
     if let Some(health_check) =
         validation::resource_name_annotation(annotations, LB_HC_ANNOTATION_KEY)?
     {
+        let service_ns = svc.namespace().unwrap();
+        let service_name = svc.name_any();
         let url = urls::compute_url(&[
             "compute",
             "beta",
@@ -240,7 +262,18 @@ pub(crate) async fn delete_health_check(
             "healthChecks",
             health_check,
         ])?;
-        if !check_if_health_check_exists(&project, &region, health_check).await? {
+        if ownership::get_owned_resource(
+            &url,
+            auth_token,
+            Owner::Service {
+                namespace: &service_ns,
+                name: &service_name,
+            },
+            LB_HC_ANNOTATION_KEY,
+        )
+        .await?
+        .is_none()
+        {
             return Ok(());
         }
         while retries != 0 {
@@ -288,6 +321,8 @@ pub(crate) async fn delete_firewall(
     if let Some(fw) =
         validation::resource_name_annotation(annotations, LB_FIREWALL_RULE_ANNOTATION_KEY)?
     {
+        let service_ns = svc.namespace().unwrap();
+        let service_name = svc.name_any();
         let url = urls::compute_url(&[
             "compute",
             "beta",
@@ -297,7 +332,18 @@ pub(crate) async fn delete_firewall(
             "firewalls",
             fw,
         ])?;
-        if !check_if_firewall_exists(project, fw).await? {
+        if ownership::get_owned_resource(
+            &url,
+            auth_token,
+            Owner::Service {
+                namespace: &service_ns,
+                name: &service_name,
+            },
+            LB_FIREWALL_RULE_ANNOTATION_KEY,
+        )
+        .await?
+        .is_none()
+        {
             return Ok(());
         }
         while retries != 0 {

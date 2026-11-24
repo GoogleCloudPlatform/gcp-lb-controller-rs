@@ -14,9 +14,13 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::bail;
+use anyhow::{anyhow, bail};
+use serde_json::Value;
 
-use crate::constants::{MAX_LOGGED_VALUE_LEN, MAX_PATH_SEGMENT_LEN, MAX_RESOURCE_NAME_LEN};
+use crate::constants::{
+    INSTANCE_GROUP_NAME_PREFIX, LB_IG_ANNOTATION_KEY, MAX_LOGGED_VALUE_LEN, MAX_PATH_SEGMENT_LEN,
+    MAX_RESOURCE_NAME_LEN,
+};
 
 /// Renders an untrusted value for logs and errors: at most MAX_LOGGED_VALUE_LEN chars, Debug-escaped.
 pub(crate) fn display_untrusted(value: &str) -> String {
@@ -139,12 +143,99 @@ pub(crate) fn resource_name_annotation<'a>(
     }
 }
 
+/// `region` and `zone` are resource-name shaped and zone == "<region>-<suffix>", suffix = 1+ of [a-z0-9].
+pub(crate) fn validate_zone_in_region(zone: &str, region: &str) -> anyhow::Result<()> {
+    validate_resource_name("region", region)?;
+    validate_resource_name("zone", zone)?;
+
+    let suffix = zone
+        .strip_prefix(region)
+        .and_then(|rest| rest.strip_prefix('-'))
+        .ok_or_else(|| {
+            anyhow!(
+                "invalid zone {}: zone must belong to region {} as '<region>-<suffix>'",
+                display_untrusted(zone),
+                display_untrusted(region)
+            )
+        })?;
+
+    if suffix.is_empty()
+        || !suffix
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+    {
+        bail!(
+            "invalid zone {}: zone suffix after '{}-' must be one or more [a-z0-9] characters",
+            display_untrusted(zone),
+            display_untrusted(region)
+        );
+    }
+
+    Ok(())
+}
+
+/// INSTANCE_GROUP_NAME_PREFIX + zone. The only place this name is formed.
+pub(crate) fn controller_instance_group_name(zone: &str) -> String {
+    format!("{}{}", INSTANCE_GROUP_NAME_PREFIX, zone)
+}
+
+/// Parses the instance-groups state annotation (JSON object zone -> group). Every zone must pass
+/// validate_zone_in_region and every group must equal controller_instance_group_name(zone).
+pub(crate) fn parse_controller_instance_groups(
+    annotation: &str,
+    region: &str,
+) -> anyhow::Result<BTreeMap<String, String>> {
+    let parsed: Value = serde_json::from_str(annotation).map_err(|err| {
+        anyhow!(
+            "invalid {} {}: must be valid JSON object ({})",
+            LB_IG_ANNOTATION_KEY,
+            display_untrusted(annotation),
+            err
+        )
+    })?;
+    let obj = parsed.as_object().ok_or_else(|| {
+        anyhow!(
+            "invalid {} {}: must be a JSON object mapping zone to instance group",
+            LB_IG_ANNOTATION_KEY,
+            display_untrusted(annotation)
+        )
+    })?;
+
+    let mut groups = BTreeMap::new();
+    for (zone, group_val) in obj {
+        let group = group_val.as_str().ok_or_else(|| {
+            anyhow!(
+                "invalid {} {}: group for zone {} must be a string",
+                LB_IG_ANNOTATION_KEY,
+                display_untrusted(&group_val.to_string()),
+                display_untrusted(zone)
+            )
+        })?;
+        validate_zone_in_region(zone, region)
+            .map_err(|err| anyhow!("invalid {}: {}", LB_IG_ANNOTATION_KEY, err))?;
+        let expected = controller_instance_group_name(zone);
+        if group != expected {
+            bail!(
+                "invalid {}: group {} for zone {} must equal controller-managed group {:?}",
+                LB_IG_ANNOTATION_KEY,
+                display_untrusted(group),
+                display_untrusted(zone),
+                expected
+            );
+        }
+        groups.insert(zone.clone(), group.to_string());
+    }
+    Ok(groups)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        display_untrusted, resource_name_annotation, validate_path_segment, validate_resource_name,
+        controller_instance_group_name, display_untrusted, parse_controller_instance_groups,
+        resource_name_annotation, validate_path_segment, validate_resource_name,
+        validate_zone_in_region,
     };
     use crate::constants::{
         LB_FORWARDING_RULE_ANNOTATION_KEY, MAX_LOGGED_VALUE_LEN, MAX_PATH_SEGMENT_LEN,
@@ -294,5 +385,60 @@ mod tests {
         let truncated_controls = display_untrusted(&long_controls);
         assert!(truncated_controls.chars().count() <= MAX_LOGGED_VALUE_LEN);
         assert!(!truncated_controls.contains('\n'));
+    }
+
+    #[test]
+    fn validate_zone_in_region_enforces_exact_region_and_suffix() {
+        assert!(validate_zone_in_region("us-central1-a", "us-central1").is_ok());
+        assert!(validate_zone_in_region("us-south1-ai1b", "us-south1").is_ok());
+
+        for bad_zone in [
+            "us-east1-b",
+            "us-central10-a",
+            "us-central1",
+            "us-central1-",
+            "us-central1-A",
+            "us-central1-a-b",
+            "../../regions/us-east1",
+            "",
+        ] {
+            assert!(
+                validate_zone_in_region(bad_zone, "us-central1").is_err(),
+                "expected zone {:?} to be rejected for region us-central1",
+                bad_zone
+            );
+        }
+    }
+
+    #[test]
+    fn parse_controller_instance_groups_accepts_managed_and_rejects_foreign_or_malformed() {
+        assert_eq!(
+            controller_instance_group_name("us-central1-a"),
+            "lb-ig-us-central1-a"
+        );
+
+        let valid = r#"{"us-central1-a":"lb-ig-us-central1-a"}"#;
+        let parsed = parse_controller_instance_groups(valid, "us-central1").unwrap();
+        assert_eq!(
+            parsed.get("us-central1-a").map(String::as_str),
+            Some("lb-ig-us-central1-a")
+        );
+
+        for invalid in [
+            r#"{"us-central1-a":"foreign-ig"}"#,
+            r#"{"us-east1-b":"lb-ig-us-east1-b"}"#,
+            r#"{"../../regions/us-east1":"lb-ig-../../regions/us-east1"}"#,
+            r#"["lb-ig-us-central1-a"]"#,
+            r#""lb-ig-us-central1-a""#,
+            r#"123"#,
+            r#"{"us-central1-a":123}"#,
+            r#"not-json"#,
+        ] {
+            assert!(
+                parse_controller_instance_groups(invalid, "us-central1").is_err(),
+                "expected {:?} to be rejected",
+                invalid
+            );
+        }
     }
 }

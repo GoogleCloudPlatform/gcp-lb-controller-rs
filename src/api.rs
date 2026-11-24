@@ -18,7 +18,6 @@ use k8s_openapi::api::core::v1::Service;
 use kube::{Client, ResourceExt};
 use log::debug;
 use reqwest::header::ACCEPT;
-use reqwest::StatusCode;
 use serde_json::{json, Value};
 use std::borrow::Borrow;
 use std::collections::{BTreeMap, HashMap};
@@ -26,13 +25,14 @@ use std::sync::Arc;
 
 use crate::cleanup::delete_forwarding_rule;
 use crate::constants::{
-    CONTROLLER_NAME, LB_BACKEND_SVC_ANNOTATION_KEY, LB_FIREWALL_RULE_ANNOTATION_KEY,
+    LB_BACKEND_SVC_ANNOTATION_KEY, LB_FIREWALL_RULE_ANNOTATION_KEY,
     LB_FORWARDING_RULE_ANNOTATION_KEY, LB_HC_ANNOTATION_KEY, LB_HC_PORT_ANNOTATION_KEY,
     LB_IG_ANNOTATION_KEY, LB_REGIONAL_MIG_ANNOTATION_KEY, LB_STATIC_IP_ANNOTATION_KEY,
     LB_ZONAL_MIG_ANNOTATION_KEY,
 };
 use crate::errors::Error::ControllerError;
-use crate::{gcp_auth, urls, utils, validation, Args};
+use crate::ownership::Owner;
+use crate::{gcp_auth, ownership, urls, utils, validation, Args};
 
 pub(crate) async fn create_tcp_hc(
     service_name: &String,
@@ -45,10 +45,7 @@ pub(crate) async fn create_tcp_hc(
 ) -> anyhow::Result<()> {
     let project = gcp_auth::get_project_id().await?;
     let auth_token = gcp_auth::get_access_token().await?;
-    let description = format!(
-        "{}/service: {}/{}",
-        CONTROLLER_NAME, service_ns, service_name
-    );
+    let description = ownership::ownership_marker(service_ns, service_name);
 
     if let Some(firewall_rule) = firewall_rule {
         debug!(
@@ -221,6 +218,16 @@ async fn verify_and_update_hc(
         "healthChecks",
         hc_name,
     ])?;
+    ownership::require_owned_resource(
+        &url,
+        &auth_token,
+        Owner::Service {
+            namespace: svc_ns,
+            name: svc_name,
+        },
+        LB_HC_ANNOTATION_KEY,
+    )
+    .await?;
     let res = reqwest::Client::new()
         .put(&url)
         .header(ACCEPT, "application/json")
@@ -340,6 +347,16 @@ async fn update_firewall_rule(
         "firewalls",
         firewall_rule,
     ])?;
+    ownership::require_owned_resource(
+        &url,
+        &auth_token,
+        Owner::Service {
+            namespace: svc_ns,
+            name: svc_name,
+        },
+        LB_FIREWALL_RULE_ANNOTATION_KEY,
+    )
+    .await?;
     let res = reqwest::Client::new()
         .put(&url)
         .header(ACCEPT, "application/json")
@@ -391,16 +408,36 @@ pub(crate) async fn process_instance_groups(
         .is_none()
     {
         let instances_map = utils::get_zones_to_instances_map(k8s_client).await?;
-        let description = format!(
-            "{}/service: {}/{}",
-            CONTROLLER_NAME,
-            svc.namespace().unwrap(),
-            svc.name_any()
-        );
+        let description = ownership::ownership_marker(&svc.namespace().unwrap(), &svc.name_any());
         for (zone, instances) in instances_map {
-            let ig_name = format!("lb-ig-{}", zone);
-            if !check_if_instance_group_exists(&project, &zone, &ig_name).await? {
+            let ig_name = validation::controller_instance_group_name(&zone);
+            let ig_url = urls::compute_url(&[
+                "compute",
+                "beta",
+                "projects",
+                &project,
+                "zones",
+                &zone,
+                "instanceGroups",
+                &ig_name,
+            ])?;
+            if ownership::get_owned_resource(
+                &ig_url,
+                &auth_token,
+                Owner::AnyService,
+                LB_IG_ANNOTATION_KEY,
+            )
+            .await?
+            .is_none()
+            {
                 create_instance_group(&project, &auth_token, &ig_name, &zone, &description).await?;
+                ownership::require_owned_resource(
+                    &ig_url,
+                    &auth_token,
+                    Owner::AnyService,
+                    LB_IG_ANNOTATION_KEY,
+                )
+                .await?;
             }
             if !check_if_all_instances_exist_in_instance_group(
                 &project, &zone, &ig_name, &instances,
@@ -560,10 +597,52 @@ pub(crate) async fn process_backend_service(
         })?;
     let backend_svc =
         validation::resource_name_annotation(annotations, LB_BACKEND_SVC_ANNOTATION_KEY)?;
-    let description = format!(
-        "{}/service: {}/{}",
-        CONTROLLER_NAME, service_ns, service_name
-    );
+    let description = ownership::ownership_marker(service_ns, service_name);
+
+    let hc_api_url = urls::compute_url(&[
+        "compute",
+        "v1",
+        "projects",
+        &project,
+        "regions",
+        region,
+        "healthChecks",
+        hc_name,
+    ])?;
+    ownership::require_owned_resource(
+        &hc_api_url,
+        &auth_token,
+        Owner::Service {
+            namespace: service_ns,
+            name: service_name,
+        },
+        LB_HC_ANNOTATION_KEY,
+    )
+    .await?;
+
+    if let Some(ig_annotation) = annotations.get(LB_IG_ANNOTATION_KEY) {
+        let controller_groups =
+            validation::parse_controller_instance_groups(ig_annotation, region)?;
+        for (zone, group) in &controller_groups {
+            let ig_url = urls::compute_url(&[
+                "compute",
+                "beta",
+                "projects",
+                &project,
+                "zones",
+                zone,
+                "instanceGroups",
+                group,
+            ])?;
+            ownership::require_owned_resource(
+                &ig_url,
+                &auth_token,
+                Owner::AnyService,
+                LB_IG_ANNOTATION_KEY,
+            )
+            .await?;
+        }
+    }
 
     let backends = build_backends(region, annotations, &project, service_name, service_ns)?;
     let hc_url = utils::build_health_check_url(&project, region, hc_name)?;
@@ -594,6 +673,16 @@ pub(crate) async fn process_backend_service(
             "backendServices",
             backend_svc,
         ])?;
+        ownership::require_owned_resource(
+            &backend_svc_url,
+            &auth_token,
+            Owner::Service {
+                namespace: service_ns,
+                name: service_name,
+            },
+            LB_BACKEND_SVC_ANNOTATION_KEY,
+        )
+        .await?;
         let res = reqwest::Client::new()
             .patch(&backend_svc_url)
             .header(ACCEPT, "application/json")
@@ -781,15 +870,35 @@ pub(crate) async fn process_forwarding_rule(
     let static_ip_name =
         validation::resource_name_annotation(annotations, LB_STATIC_IP_ANNOTATION_KEY)?;
     if let Some(forwarding_rule) = forwarding_rule {
+        let service_ns = svc.namespace().unwrap();
+        let service_name = svc.name_any();
+        let fr_url = urls::compute_url(&[
+            "compute",
+            "beta",
+            "projects",
+            &project,
+            "regions",
+            region,
+            "forwardingRules",
+            forwarding_rule,
+        ])?;
+        let fr_resource = ownership::require_owned_resource(
+            &fr_url,
+            &auth_token,
+            Owner::Service {
+                namespace: &service_ns,
+                name: &service_name,
+            },
+            LB_FORWARDING_RULE_ANNOTATION_KEY,
+        )
+        .await?;
         if let Some(name) = static_ip_name {
-            let forwarding_rule_ip =
-                get_forwarding_rule_ip_address(&project, region, forwarding_rule).await?;
+            let forwarding_rule_ip = forwarding_rule_ip_address(&fr_resource, forwarding_rule)?;
             let static_ip = get_ip_addr(name, &project, &auth_token, Some(region)).await?;
             if forwarding_rule_ip.ne(&static_ip) {
                 debug!(
                     "static ip changed, recreating forwarding-rule for service: {}/{}",
-                    svc.namespace().unwrap(),
-                    svc.name_any()
+                    service_ns, service_name
                 );
                 delete_forwarding_rule(&svc, &project, &auth_token, region).await?;
                 create_forwarding_rule(&svc, &project, &auth_token, region, annotations, k8s_client)
@@ -825,10 +934,27 @@ pub(crate) async fn create_forwarding_rule(
             })?;
     let static_ip_name =
         validation::resource_name_annotation(annotations, LB_STATIC_IP_ANNOTATION_KEY)?;
-    let description = format!(
-        "{}/service: {}/{}",
-        CONTROLLER_NAME, service_ns, service_name
-    );
+    let backend_svc_api_url = urls::compute_url(&[
+        "compute",
+        "beta",
+        "projects",
+        project,
+        "regions",
+        region,
+        "backendServices",
+        backend_svc,
+    ])?;
+    ownership::require_owned_resource(
+        &backend_svc_api_url,
+        auth_token,
+        Owner::Service {
+            namespace: service_ns,
+            name: service_name,
+        },
+        LB_BACKEND_SVC_ANNOTATION_KEY,
+    )
+    .await?;
+    let description = ownership::ownership_marker(service_ns, service_name);
     let ports = svc
         .spec
         .borrow()
@@ -893,7 +1019,27 @@ pub(crate) async fn create_forwarding_rule(
             k8s_client,
         )
         .await?;
-        let ip_address = get_forwarding_rule_ip_address(&project, region, forwarding_rule).await?;
+        let fr_url = urls::compute_url(&[
+            "compute",
+            "beta",
+            "projects",
+            project,
+            "regions",
+            region,
+            "forwardingRules",
+            forwarding_rule,
+        ])?;
+        let fr_resource = ownership::require_owned_resource(
+            &fr_url,
+            auth_token,
+            Owner::Service {
+                namespace: service_ns,
+                name: service_name,
+            },
+            LB_FORWARDING_RULE_ANNOTATION_KEY,
+        )
+        .await?;
+        let ip_address = forwarding_rule_ip_address(&fr_resource, forwarding_rule)?;
         utils::update_svc_lb_status(&svc, ip_address, k8s_client)
             .await
             .map_err(ControllerError)?;
@@ -903,90 +1049,6 @@ pub(crate) async fn create_forwarding_rule(
             "failed to create forwarding rule, error_message: {}",
             res["statusMessage"]
         ))
-    }
-}
-
-pub(crate) async fn check_if_forwarding_rule_exists(
-    project: &str,
-    region: &str,
-    forwarding_rule: &str,
-) -> anyhow::Result<bool> {
-    let auth_token = gcp_auth::get_access_token().await?;
-    let status_code = reqwest::Client::new()
-        .get(urls::compute_url(&[
-            "compute",
-            "beta",
-            "projects",
-            project,
-            "regions",
-            region,
-            "forwardingRules",
-            forwarding_rule,
-        ])?)
-        .header(ACCEPT, "application/json")
-        .bearer_auth(&auth_token)
-        .send()
-        .await?
-        .status();
-    match status_code {
-        StatusCode::OK => Ok(true),
-        _ => Ok(false),
-    }
-}
-
-pub(crate) async fn check_if_backend_svc_exists(
-    project: &str,
-    region: &str,
-    backend_svc: &str,
-) -> anyhow::Result<bool> {
-    let auth_token = gcp_auth::get_access_token().await?;
-    let status_code = reqwest::Client::new()
-        .get(urls::compute_url(&[
-            "compute",
-            "beta",
-            "projects",
-            project,
-            "regions",
-            region,
-            "backendServices",
-            backend_svc,
-        ])?)
-        .header(ACCEPT, "application/json")
-        .bearer_auth(&auth_token)
-        .send()
-        .await?
-        .status();
-    match status_code {
-        StatusCode::OK => Ok(true),
-        _ => Ok(false),
-    }
-}
-
-pub(crate) async fn check_if_instance_group_exists(
-    project: &str,
-    zone: &str,
-    group: &str,
-) -> anyhow::Result<bool> {
-    let auth_token = gcp_auth::get_access_token().await?;
-    let status_code = reqwest::Client::new()
-        .get(urls::compute_url(&[
-            "compute",
-            "beta",
-            "projects",
-            project,
-            "zones",
-            zone,
-            "instanceGroups",
-            group,
-        ])?)
-        .header(ACCEPT, "application/json")
-        .bearer_auth(&auth_token)
-        .send()
-        .await?
-        .status();
-    match status_code {
-        StatusCode::OK => Ok(true),
-        _ => Ok(false),
     }
 }
 
@@ -1035,85 +1097,15 @@ pub(crate) async fn check_if_all_instances_exist_in_instance_group(
     Ok(!current_instances.is_empty() && true)
 }
 
-pub(crate) async fn check_if_health_check_exists(
-    project: &str,
-    region: &str,
-    hc_name: &str,
-) -> anyhow::Result<bool> {
-    let auth_token = gcp_auth::get_access_token().await?;
-    let status_code = reqwest::Client::new()
-        .get(urls::compute_url(&[
-            "compute",
-            "v1",
-            "projects",
-            project,
-            "regions",
-            region,
-            "healthChecks",
-            hc_name,
-        ])?)
-        .header(ACCEPT, "application/json")
-        .bearer_auth(&auth_token)
-        .send()
-        .await?
-        .status();
-    match status_code {
-        StatusCode::OK => Ok(true),
-        _ => Ok(false),
-    }
-}
-
-pub(crate) async fn check_if_firewall_exists(project: &str, fw: &str) -> anyhow::Result<bool> {
-    let auth_token = gcp_auth::get_access_token().await?;
-    let status_code = reqwest::Client::new()
-        .get(urls::compute_url(&[
-            "compute",
-            "v1",
-            "projects",
-            project,
-            "global",
-            "firewalls",
-            fw,
-        ])?)
-        .header(ACCEPT, "application/json")
-        .bearer_auth(&auth_token)
-        .send()
-        .await?
-        .status();
-    match status_code {
-        StatusCode::OK => Ok(true),
-        _ => Ok(false),
-    }
-}
-
-pub(crate) async fn get_forwarding_rule_ip_address(
-    project: &str,
-    region: &str,
+pub(crate) fn forwarding_rule_ip_address(
+    resource: &Value,
     forwarding_rule: &str,
 ) -> anyhow::Result<String> {
-    let auth_token = gcp_auth::get_access_token().await?;
-    let res = reqwest::Client::new()
-        .get(urls::compute_url(&[
-            "compute",
-            "beta",
-            "projects",
-            project,
-            "regions",
-            region,
-            "forwardingRules",
-            forwarding_rule,
-        ])?)
-        .header(ACCEPT, "application/json")
-        .bearer_auth(&auth_token)
-        .send()
-        .await?
-        .json::<Value>()
-        .await?;
-    match res["IPAddress"].as_str() {
+    match resource["IPAddress"].as_str() {
         Some(ip) => Ok(ip.to_string()),
-        _ => Err(anyhow!(
+        None => Err(anyhow!(
             "failed to get forwarding rule ip address: {}",
-            forwarding_rule
+            validation::display_untrusted(forwarding_rule)
         )),
     }
 }
@@ -1158,5 +1150,27 @@ pub(crate) async fn get_ip_addr(
             "error occurred fetching the ip address by name: {}",
             name
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::forwarding_rule_ip_address;
+
+    #[test]
+    fn forwarding_rule_ip_address_extracts_present_ip_and_errors_when_missing() {
+        let present = json!({
+            "name": "fr-1",
+            "IPAddress": "203.0.113.10"
+        });
+        assert_eq!(
+            forwarding_rule_ip_address(&present, "fr-1").unwrap(),
+            "203.0.113.10"
+        );
+
+        let missing = json!({"name": "fr-1"});
+        assert!(forwarding_rule_ip_address(&missing, "fr-1").is_err());
     }
 }
