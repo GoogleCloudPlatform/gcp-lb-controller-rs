@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use anyhow::{anyhow, Context};
+use anyhow::anyhow;
 use clap::Parser;
 use k8s_openapi::api::core::v1::Service;
 use kube::{Client, ResourceExt};
@@ -32,6 +32,7 @@ use crate::constants::{
 };
 use crate::errors::Error::ControllerError;
 use crate::ownership::Owner;
+use crate::validation::InstanceGroupAllowlist;
 use crate::{gcp_auth, ownership, urls, utils, validation, Args};
 
 pub(crate) async fn create_tcp_hc(
@@ -644,7 +645,16 @@ pub(crate) async fn process_backend_service(
         }
     }
 
-    let backends = build_backends(region, annotations, &project, service_name, service_ns)?;
+    let args = Args::parse();
+    let allowlist = InstanceGroupAllowlist::parse(&args.allowed_instance_groups)?;
+    let backends = build_backends(
+        region,
+        annotations,
+        &project,
+        service_name,
+        service_ns,
+        &allowlist,
+    )?;
     let hc_url = utils::build_health_check_url(&project, region, hc_name)?;
     if let Some(backend_svc) = backend_svc {
         debug!(
@@ -764,38 +774,48 @@ fn build_backends(
     project: &str,
     service_name: &str,
     service_ns: &str,
+    allowlist: &InstanceGroupAllowlist,
 ) -> anyhow::Result<Vec<HashMap<String, String>>> {
+    let mut backends = vec![];
     if let Some(unmanaged_ig) = annotations.get(LB_IG_ANNOTATION_KEY) {
         debug!(
             "using zonal unmanaged instance groups for service: {}/{}",
             service_ns, service_name
         );
-        return build_zonal_instance_group_backends(
-            project,
-            service_ns,
-            service_name,
-            LB_IG_ANNOTATION_KEY,
-            unmanaged_ig,
-        );
-    }
-    if let Some(zonal_ig) = annotations.get(LB_ZONAL_MIG_ANNOTATION_KEY) {
+        let groups = validation::parse_controller_instance_groups(unmanaged_ig, region)?;
+        backends = build_zonal_backends_from_map(project, service_ns, service_name, groups)?;
+    } else if let Some(zonal_ig) = annotations.get(LB_ZONAL_MIG_ANNOTATION_KEY) {
         debug!(
             "using zonal managed instance groups for service: {}/{}",
             service_ns, service_name
         );
-        return build_zonal_instance_group_backends(
-            project,
-            service_ns,
-            service_name,
-            LB_ZONAL_MIG_ANNOTATION_KEY,
-            zonal_ig,
-        );
-    }
-    let mut backends = vec![];
-    if let Some(managed_ig) = annotations.get(LB_REGIONAL_MIG_ANNOTATION_KEY) {
-        for group in managed_ig.split(',') {
-            validation::validate_resource_name(LB_REGIONAL_MIG_ANNOTATION_KEY, group)?;
-            let group_name = group.to_string();
+        let groups = validation::parse_zonal_migs(zonal_ig, region)?;
+        for (zone, group_name) in &groups {
+            if !allowlist.permits(service_ns, zone, group_name) {
+                return Err(anyhow!(
+                    "instance group {} in zone {} from {} is not permitted for namespace {} \
+                     by --allowed-instance-groups",
+                    validation::display_untrusted(group_name),
+                    validation::display_untrusted(zone),
+                    LB_ZONAL_MIG_ANNOTATION_KEY,
+                    validation::display_untrusted(service_ns)
+                ));
+            }
+        }
+        backends = build_zonal_backends_from_map(project, service_ns, service_name, groups)?;
+    } else if let Some(managed_ig) = annotations.get(LB_REGIONAL_MIG_ANNOTATION_KEY) {
+        let groups = validation::parse_regional_migs(managed_ig)?;
+        for group_name in groups {
+            if !allowlist.permits(service_ns, region, &group_name) {
+                return Err(anyhow!(
+                    "regional instance group {} in region {} from {} is not permitted for \
+                     namespace {} by --allowed-instance-groups",
+                    validation::display_untrusted(&group_name),
+                    validation::display_untrusted(region),
+                    LB_REGIONAL_MIG_ANNOTATION_KEY,
+                    validation::display_untrusted(service_ns)
+                ));
+            }
             let mut backend = HashMap::<String, String>::new();
             backend.insert(
                 String::from("group"),
@@ -821,25 +841,14 @@ fn build_backends(
     Ok(backends)
 }
 
-fn build_zonal_instance_group_backends(
+fn build_zonal_backends_from_map(
     project: &str,
     svc_ns: &str,
     svc_name: &str,
-    annotation_key: &str,
-    instance_groups: &str,
+    groups: BTreeMap<String, String>,
 ) -> anyhow::Result<Vec<HashMap<String, String>>> {
     let mut backends = vec![];
-    let groups: BTreeMap<String, String> =
-        serde_json::from_str(instance_groups).with_context(|| {
-            format!(
-                "invalid {} {}: expected JSON object mapping zone to instance group",
-                annotation_key,
-                validation::display_untrusted(instance_groups)
-            )
-        })?;
     for (zone, group_name) in groups {
-        validation::validate_resource_name(annotation_key, &zone)?;
-        validation::validate_resource_name(annotation_key, &group_name)?;
         let mut backend = HashMap::<String, String>::new();
         backend.insert(
             String::from("group"),
@@ -1155,9 +1164,224 @@ pub(crate) async fn get_ip_addr(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use serde_json::json;
 
-    use super::forwarding_rule_ip_address;
+    use super::{build_backends, forwarding_rule_ip_address};
+    use crate::constants::{
+        LB_IG_ANNOTATION_KEY, LB_REGIONAL_MIG_ANNOTATION_KEY, LB_ZONAL_MIG_ANNOTATION_KEY,
+    };
+    use crate::validation::InstanceGroupAllowlist;
+
+    #[test]
+    fn build_backends_refuses_unallowlisted_migs_traversal_and_foreign_groups() {
+        let empty_allowlist = InstanceGroupAllowlist::default();
+
+        // PoC 1: un-allowlisted zonal MIG
+        let mut annotations = BTreeMap::new();
+        annotations.insert(
+            LB_ZONAL_MIG_ANNOTATION_KEY.to_string(),
+            r#"{"us-central1-a":"victim-zonal-mig"}"#.to_string(),
+        );
+        assert!(build_backends(
+            "us-central1",
+            &annotations,
+            "proj-1",
+            "web",
+            "tenant-ns",
+            &empty_allowlist
+        )
+        .is_err());
+
+        // PoC 2: un-allowlisted regional MIGs
+        let mut annotations = BTreeMap::new();
+        annotations.insert(
+            LB_REGIONAL_MIG_ANNOTATION_KEY.to_string(),
+            "victim-regional-mig".to_string(),
+        );
+        assert!(build_backends(
+            "us-central1",
+            &annotations,
+            "proj-1",
+            "web",
+            "tenant-ns",
+            &empty_allowlist
+        )
+        .is_err());
+
+        // PoC 3: traversal zone key in instance-groups
+        let mut annotations = BTreeMap::new();
+        annotations.insert(
+            LB_IG_ANNOTATION_KEY.to_string(),
+            r#"{"../../regions/us-east1":"lb-ig-us-central1-a"}"#.to_string(),
+        );
+        assert!(build_backends(
+            "us-central1",
+            &annotations,
+            "proj-1",
+            "web",
+            "tenant-ns",
+            &empty_allowlist
+        )
+        .is_err());
+
+        // Foreign group in instance-groups (even when allowlisted for MIGs)
+        let allowlist =
+            InstanceGroupAllowlist::parse(&["tenant-ns/us-central1-a/foreign-ig".to_string()])
+                .unwrap();
+        let mut annotations = BTreeMap::new();
+        annotations.insert(
+            LB_IG_ANNOTATION_KEY.to_string(),
+            r#"{"us-central1-a":"foreign-ig"}"#.to_string(),
+        );
+        assert!(build_backends(
+            "us-central1",
+            &annotations,
+            "proj-1",
+            "web",
+            "tenant-ns",
+            &allowlist
+        )
+        .is_err());
+
+        // Controller-managed group in instance-groups is accepted with empty allowlist
+        let mut annotations = BTreeMap::new();
+        annotations.insert(
+            LB_IG_ANNOTATION_KEY.to_string(),
+            r#"{"us-central1-a":"lb-ig-us-central1-a"}"#.to_string(),
+        );
+        let managed = build_backends(
+            "us-central1",
+            &annotations,
+            "proj-1",
+            "web",
+            "tenant-ns",
+            &empty_allowlist,
+        )
+        .unwrap();
+        assert_eq!(managed.len(), 1);
+        assert_eq!(
+            managed[0].get("group").map(String::as_str),
+            Some("projects/proj-1/zones/us-central1-a/instanceGroups/lb-ig-us-central1-a")
+        );
+    }
+
+    #[test]
+    fn build_backends_enforces_namespace_wildcard_all_or_nothing_and_region_bounds() {
+        let allowlist = InstanceGroupAllowlist::parse(&[
+            "team-a/us-central1-a/zonal-mig-a".to_string(),
+            "*/us-central1-b/shared-zonal-mig".to_string(),
+            "team-a/us-central1/regional-mig-a".to_string(),
+            "*/us-central1/shared-regional-mig".to_string(),
+            "*/us-east1-b/east-mig".to_string(),
+        ])
+        .unwrap();
+
+        // Allowlisted zonal MIG accepted for its namespace, refused for another namespace
+        let mut zonal_ann = BTreeMap::new();
+        zonal_ann.insert(
+            LB_ZONAL_MIG_ANNOTATION_KEY.to_string(),
+            r#"{"us-central1-a":"zonal-mig-a"}"#.to_string(),
+        );
+        let backends = build_backends(
+            "us-central1",
+            &zonal_ann,
+            "proj-1",
+            "web",
+            "team-a",
+            &allowlist,
+        )
+        .unwrap();
+        assert_eq!(backends.len(), 1);
+        assert!(build_backends(
+            "us-central1",
+            &zonal_ann,
+            "proj-1",
+            "web",
+            "team-b",
+            &allowlist
+        )
+        .is_err());
+
+        // Accepted through "*" namespace for both zonal and regional MIGs
+        let mut wildcard_zonal = BTreeMap::new();
+        wildcard_zonal.insert(
+            LB_ZONAL_MIG_ANNOTATION_KEY.to_string(),
+            r#"{"us-central1-b":"shared-zonal-mig"}"#.to_string(),
+        );
+        assert!(build_backends(
+            "us-central1",
+            &wildcard_zonal,
+            "proj-1",
+            "web",
+            "any-ns",
+            &allowlist
+        )
+        .is_ok());
+
+        let mut wildcard_regional = BTreeMap::new();
+        wildcard_regional.insert(
+            LB_REGIONAL_MIG_ANNOTATION_KEY.to_string(),
+            "shared-regional-mig".to_string(),
+        );
+        assert!(build_backends(
+            "us-central1",
+            &wildcard_regional,
+            "proj-1",
+            "web",
+            "any-ns",
+            &allowlist
+        )
+        .is_ok());
+
+        // One refused group among several fails the whole call (zonal and regional)
+        let mut mixed_zonal = BTreeMap::new();
+        mixed_zonal.insert(
+            LB_ZONAL_MIG_ANNOTATION_KEY.to_string(),
+            r#"{"us-central1-a":"zonal-mig-a","us-central1-b":"unallowed-mig"}"#.to_string(),
+        );
+        assert!(build_backends(
+            "us-central1",
+            &mixed_zonal,
+            "proj-1",
+            "web",
+            "team-a",
+            &allowlist
+        )
+        .is_err());
+
+        let mut mixed_regional = BTreeMap::new();
+        mixed_regional.insert(
+            LB_REGIONAL_MIG_ANNOTATION_KEY.to_string(),
+            "regional-mig-a,unallowed-regional-mig".to_string(),
+        );
+        assert!(build_backends(
+            "us-central1",
+            &mixed_regional,
+            "proj-1",
+            "web",
+            "team-a",
+            &allowlist
+        )
+        .is_err());
+
+        // Zone outside controller's region is refused even if allowlisted
+        let mut cross_region = BTreeMap::new();
+        cross_region.insert(
+            LB_ZONAL_MIG_ANNOTATION_KEY.to_string(),
+            r#"{"us-east1-b":"east-mig"}"#.to_string(),
+        );
+        assert!(build_backends(
+            "us-central1",
+            &cross_region,
+            "proj-1",
+            "web",
+            "team-a",
+            &allowlist
+        )
+        .is_err());
+    }
 
     #[test]
     fn forwarding_rule_ip_address_extracts_present_ip_and_errors_when_missing() {

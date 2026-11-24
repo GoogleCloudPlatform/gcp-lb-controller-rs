@@ -12,14 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{anyhow, bail};
 use serde_json::Value;
 
 use crate::constants::{
-    INSTANCE_GROUP_NAME_PREFIX, LB_IG_ANNOTATION_KEY, MAX_LOGGED_VALUE_LEN, MAX_PATH_SEGMENT_LEN,
-    MAX_RESOURCE_NAME_LEN,
+    ALLOWLIST_ANY_NAMESPACE, ALLOWLIST_ENTRY_SEPARATOR, INSTANCE_GROUP_NAME_PREFIX,
+    LB_IG_ANNOTATION_KEY, LB_REGIONAL_MIG_ANNOTATION_KEY, LB_ZONAL_MIG_ANNOTATION_KEY,
+    MAX_LOGGED_VALUE_LEN, MAX_PATH_SEGMENT_LEN, MAX_RESOURCE_NAME_LEN,
 };
 
 /// Renders an untrusted value for logs and errors: at most MAX_LOGGED_VALUE_LEN chars, Debug-escaped.
@@ -228,14 +229,154 @@ pub(crate) fn parse_controller_instance_groups(
     Ok(groups)
 }
 
+/// JSON object zone -> group; zones pass validate_zone_in_region, groups pass validate_resource_name.
+pub(crate) fn parse_zonal_migs(
+    annotation: &str,
+    region: &str,
+) -> anyhow::Result<BTreeMap<String, String>> {
+    let parsed: Value = serde_json::from_str(annotation).map_err(|err| {
+        anyhow!(
+            "invalid {} {}: must be valid JSON object ({})",
+            LB_ZONAL_MIG_ANNOTATION_KEY,
+            display_untrusted(annotation),
+            err
+        )
+    })?;
+    let obj = parsed.as_object().ok_or_else(|| {
+        anyhow!(
+            "invalid {} {}: must be a JSON object mapping zone to instance group",
+            LB_ZONAL_MIG_ANNOTATION_KEY,
+            display_untrusted(annotation)
+        )
+    })?;
+
+    let mut groups = BTreeMap::new();
+    for (zone, group_val) in obj {
+        let group = group_val.as_str().ok_or_else(|| {
+            anyhow!(
+                "invalid {} {}: group for zone {} must be a string",
+                LB_ZONAL_MIG_ANNOTATION_KEY,
+                display_untrusted(&group_val.to_string()),
+                display_untrusted(zone)
+            )
+        })?;
+        validate_zone_in_region(zone, region)
+            .map_err(|err| anyhow!("invalid {}: {}", LB_ZONAL_MIG_ANNOTATION_KEY, err))?;
+        validate_resource_name(LB_ZONAL_MIG_ANNOTATION_KEY, group)?;
+        groups.insert(zone.clone(), group.to_string());
+    }
+    Ok(groups)
+}
+
+/// Comma separated names, each passing validate_resource_name. No trimming.
+pub(crate) fn parse_regional_migs(annotation: &str) -> anyhow::Result<Vec<String>> {
+    let mut groups = Vec::new();
+    for group in annotation.split(',') {
+        validate_resource_name(LB_REGIONAL_MIG_ANNOTATION_KEY, group)?;
+        groups.push(group.to_string());
+    }
+    Ok(groups)
+}
+
+fn validate_rfc1123_label(kind: &str, value: &str) -> anyhow::Result<()> {
+    if value.is_empty() {
+        bail!(
+            "invalid {} {}: RFC 1123 label must not be empty",
+            kind,
+            display_untrusted(value)
+        );
+    }
+    if value.len() > MAX_RESOURCE_NAME_LEN {
+        bail!(
+            "invalid {} {}: RFC 1123 label exceeds maximum length of {} bytes",
+            kind,
+            display_untrusted(value),
+            MAX_RESOURCE_NAME_LEN
+        );
+    }
+
+    let bytes = value.as_bytes();
+    let first = bytes[0];
+    if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
+        bail!(
+            "invalid {} {}: RFC 1123 label must start with a lowercase ASCII letter or digit [a-z0-9]",
+            kind,
+            display_untrusted(value)
+        );
+    }
+    let last = bytes[bytes.len() - 1];
+    if !(last.is_ascii_lowercase() || last.is_ascii_digit()) {
+        bail!(
+            "invalid {} {}: RFC 1123 label must end with a lowercase ASCII letter or digit [a-z0-9]",
+            kind,
+            display_untrusted(value)
+        );
+    }
+    if bytes.len() > 2 {
+        for &b in &bytes[1..bytes.len() - 1] {
+            if !(b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') {
+                bail!(
+                    "invalid {} {}: RFC 1123 label may only contain lowercase ASCII letters, digits, and '-'",
+                    kind,
+                    display_untrusted(value)
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct InstanceGroupAllowlist {
+    entries: BTreeSet<(String, String, String)>,
+}
+
+impl InstanceGroupAllowlist {
+    /// Entries are "<namespace>/<location>/<group>": exactly three parts. namespace is "*" or an
+    /// RFC 1123 label; location (a zone, or a region for regional groups) and group pass
+    /// validate_resource_name. Any malformed entry is an error.
+    pub(crate) fn parse(entries: &[String]) -> anyhow::Result<Self> {
+        let mut parsed = BTreeSet::new();
+        for entry in entries {
+            let parts: Vec<&str> = entry.split(ALLOWLIST_ENTRY_SEPARATOR).collect();
+            if parts.len() != 3 {
+                bail!(
+                    "invalid allowlist entry {}: expected '<namespace>/<location>/<group>' with exactly three '{}'-separated parts",
+                    display_untrusted(entry),
+                    ALLOWLIST_ENTRY_SEPARATOR
+                );
+            }
+            let (namespace, location, group) = (parts[0], parts[1], parts[2]);
+            if namespace != ALLOWLIST_ANY_NAMESPACE {
+                validate_rfc1123_label("allowlist namespace", namespace)?;
+            }
+            validate_resource_name("allowlist location", location)?;
+            validate_resource_name("allowlist group", group)?;
+            parsed.insert((
+                namespace.to_string(),
+                location.to_string(),
+                group.to_string(),
+            ));
+        }
+        Ok(Self { entries: parsed })
+    }
+
+    /// True iff an entry matches: namespace is "*" or equal, location equal, group equal.
+    pub(crate) fn permits(&self, namespace: &str, location: &str, group: &str) -> bool {
+        self.entries.iter().any(|(ns, loc, grp)| {
+            (ns == ALLOWLIST_ANY_NAMESPACE || ns == namespace) && loc == location && grp == group
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 
     use super::{
         controller_instance_group_name, display_untrusted, parse_controller_instance_groups,
-        resource_name_annotation, validate_path_segment, validate_resource_name,
-        validate_zone_in_region,
+        parse_regional_migs, parse_zonal_migs, resource_name_annotation, validate_path_segment,
+        validate_resource_name, validate_zone_in_region, InstanceGroupAllowlist,
     };
     use crate::constants::{
         LB_FORWARDING_RULE_ANNOTATION_KEY, MAX_LOGGED_VALUE_LEN, MAX_PATH_SEGMENT_LEN,
@@ -440,5 +581,99 @@ mod tests {
                 invalid
             );
         }
+    }
+
+    #[test]
+    fn parse_zonal_and_regional_migs_enforce_strict_grammars() {
+        let zonal = parse_zonal_migs(
+            r#"{"us-central1-a":"mig-a","us-central1-b":"mig-b"}"#,
+            "us-central1",
+        )
+        .unwrap();
+        assert_eq!(zonal.len(), 2);
+        assert_eq!(
+            zonal.get("us-central1-a").map(String::as_str),
+            Some("mig-a")
+        );
+
+        for bad_zonal in [
+            r#"{"us-east1-a":"mig-a"}"#,
+            r#"{"us-central1-a":"../mig"}"#,
+            r#"{"us-central1-a":""}"#,
+            r#"["mig-a"]"#,
+            r#"{"us-central1-a":42}"#,
+        ] {
+            assert!(
+                parse_zonal_migs(bad_zonal, "us-central1").is_err(),
+                "expected zonal-migs {:?} to be rejected",
+                bad_zonal
+            );
+        }
+
+        assert_eq!(
+            parse_regional_migs("mig-a,mig-b").unwrap(),
+            vec!["mig-a".to_string(), "mig-b".to_string()]
+        );
+        for bad_regional in [
+            "",
+            "mig-a, mig-b",
+            " mig-a",
+            "mig-a,",
+            "mig-a,,mig-b",
+            "MIG-A",
+        ] {
+            assert!(
+                parse_regional_migs(bad_regional).is_err(),
+                "expected regional-migs {:?} to be rejected",
+                bad_regional
+            );
+        }
+    }
+
+    #[test]
+    fn allowlist_rejects_malformed_entries_and_matches_exact_fields() {
+        let empty = InstanceGroupAllowlist::default();
+        assert!(!empty.permits("default", "us-central1-a", "mig-1"));
+        assert_eq!(InstanceGroupAllowlist::parse(&[]).unwrap(), empty);
+
+        for malformed in [
+            "",
+            "default/us-central1-a",
+            "default/us-central1-a/mig-1/extra",
+            "/us-central1-a/mig-1",
+            "default//mig-1",
+            "default/us-central1-a/",
+            "Default/us-central1-a/mig-1",
+            "-bad/us-central1-a/mig-1",
+            "bad-/us-central1-a/mig-1",
+            "ns*wild/us-central1-a/mig-1",
+            "default/*/mig-1",
+            "default/us-central1-a/*",
+            " default/us-central1-a/mig-1",
+            "default/us-central1-a/mig-1 ",
+            "default/us-central1-a/ mig-1",
+        ] {
+            assert!(
+                InstanceGroupAllowlist::parse(&[malformed.to_string()]).is_err(),
+                "expected allowlist entry {:?} to be rejected",
+                malformed
+            );
+        }
+
+        let allowlist = InstanceGroupAllowlist::parse(&[
+            "team-a/us-central1-a/zonal-mig-1".to_string(),
+            "0-numeric-ns/us-central1-b/zonal-mig-2".to_string(),
+            "*/us-central1/shared-rmig".to_string(),
+        ])
+        .unwrap();
+
+        assert!(allowlist.permits("team-a", "us-central1-a", "zonal-mig-1"));
+        assert!(!allowlist.permits("team-b", "us-central1-a", "zonal-mig-1"));
+        assert!(!allowlist.permits("team-a", "us-central1-b", "zonal-mig-1"));
+        assert!(!allowlist.permits("team-a", "us-central1-a", "zonal-mig-2"));
+        assert!(allowlist.permits("0-numeric-ns", "us-central1-b", "zonal-mig-2"));
+        assert!(allowlist.permits("team-a", "us-central1", "shared-rmig"));
+        assert!(allowlist.permits("team-b", "us-central1", "shared-rmig"));
+        assert!(!allowlist.permits("team-a", "us-east1", "shared-rmig"));
     }
 }
