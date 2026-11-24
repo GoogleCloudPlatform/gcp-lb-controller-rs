@@ -21,7 +21,10 @@ mod constants;
 mod controller;
 mod errors;
 mod gcp_auth;
+mod ownership;
+mod urls;
 mod utils;
+mod validation;
 
 use anyhow::Context;
 use clap::Parser;
@@ -34,6 +37,9 @@ async fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(Env::default().default_filter_or("info"))
         .format_timestamp(None)
         .init();
+
+    let args = Args::parse();
+    validation::InstanceGroupAllowlist::parse(&args.allowed_instance_groups)?;
 
     let state = State::default();
     tokio::try_join!(controller::run(state.clone()))
@@ -67,4 +73,35 @@ pub(crate) struct Args {
     pub(crate) network: String,
     #[arg(long, default_value = "")]
     pub(crate) shared_vpc_project_id: String,
+    /// Instance groups Services may select with the zonal-migs / regional-migs annotations, as
+    /// comma separated <namespace>/<location>/<group> entries (<namespace> may be *).
+    #[arg(long, value_delimiter = ',')]
+    pub(crate) allowed_instance_groups: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::Args;
+
+    #[test]
+    fn args_parses_allowed_instance_groups_and_defaults_to_empty() {
+        let default_args = Args::try_parse_from(["gcp-lb-controller-rs", "--network", "default"])
+            .expect("default args should parse");
+        assert!(default_args.allowed_instance_groups.is_empty());
+
+        let with_allowlist = Args::try_parse_from([
+            "gcp-lb-controller-rs",
+            "--network",
+            "default",
+            "--allowed-instance-groups",
+            "a/b/c,d/e/f",
+        ])
+        .expect("allowlist args should parse");
+        assert_eq!(
+            with_allowlist.allowed_instance_groups,
+            vec!["a/b/c".to_string(), "d/e/f".to_string()]
+        );
+    }
 }

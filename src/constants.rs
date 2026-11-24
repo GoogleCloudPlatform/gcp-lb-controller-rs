@@ -37,3 +37,11 @@ pub(crate) const LB_FORWARDING_RULE_ANNOTATION_KEY: &str = "gcp-lb-controller/fo
 
 // Loadbalancer firewall CIDRs
 pub(crate) const NLB_FIREWALL_CIDR: &str = "35.191.0.0/16,209.85.152.0/22,209.85.204.0/22";
+
+// Validation limits
+pub(crate) const MAX_RESOURCE_NAME_LEN: usize = 63;
+pub(crate) const MAX_PATH_SEGMENT_LEN: usize = 255;
+pub(crate) const MAX_LOGGED_VALUE_LEN: usize = 64;
+pub(crate) const INSTANCE_GROUP_NAME_PREFIX: &str = "lb-ig-";
+pub(crate) const ALLOWLIST_ENTRY_SEPARATOR: char = '/';
+pub(crate) const ALLOWLIST_ANY_NAMESPACE: &str = "*";
